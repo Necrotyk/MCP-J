@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "mcp-j-engine",
+    "mcp-j-cli",
+    "mcp-j-proxy",
+]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
