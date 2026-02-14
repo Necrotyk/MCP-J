@@ -16,6 +16,22 @@ async fn main() {
     println!("Launching jailed process: {:?}", cli.command);
 
     // Initialize supervisor
-    let supervisor = Supervisor::new();
-    supervisor.run();
+    // We assume the first arg is the binary and the rest are args
+    let binary = std::path::PathBuf::from(&cli.command[0]);
+    let args = cli.command[1..].to_vec();
+
+    // Create supervisor with the command
+    let supervisor = match Supervisor::new(binary, args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to initialize supervisor: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = supervisor.start() {
+        eprintln!("Supervisor failed: {}", e);
+        std::process::exit(1);
+    }
 }
+
