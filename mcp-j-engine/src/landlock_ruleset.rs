@@ -31,36 +31,45 @@ impl LandlockRuleset {
     }
 
     pub fn apply(&self) -> Result<()> {
-        let abi = ABI::V1;
+        // ABI V4 supports more features (e.g. truncate), use best effort or specific version?
+        // Let's rely on the crate's robust handling or defaulting.
+        // The landlock crate's `Ruleset::new()` typically picks the highest supported ABI by default 
+        // or allows configuration.
+        // We'll try to use a recent ABI if available, but fallback handling is good.
+        let abi = ABI::V4; 
+        
         let mut ruleset = Ruleset::new()
             .handle_access(AccessFs::from_all(abi))?
             .create()?;
 
         for (path, access) in &self.allowed_paths {
-             // The Rust landlock crate typically uses `path_beneath` which accepts Into<PathFd>.
-             // If we iterate, we need to add rules one by one.
-             // We'll use strict handling and warn/error if path resolution fails.
-             // Assume basic paths exist for now.
+             // We need to resolve path to PathFd or use Path directly if crate supports it.
+             // landlock crate 0.4 `add_rule` takes `PathFd` which handles opening the path.
+             // We must handle the case where path doesn't exist (skip or error?)
+             // For strictness, if a configured allowed path is missing, arguably we should warn but proceed,
+             // or fail. Let's warn and continue to allow flexible configs.
              
-             // Depending on crate version, `add_rule` might be different.
-             // Assuming hypothetical `add_rule` based on known patterns.
-             // Actually, `start_rule().path(path).access(access).add()?`
+             let path_fd = match PathFd::new(path) {
+                 Ok(fd) => fd,
+                 Err(e) => {
+                     // Log warning? 
+                     eprintln!("Warning: Failed to resolve path for Landlock rule: {:?} - {}", path, e);
+                     continue;
+                 }
+             };
              
-             // Since I can't confirm crate API, I'll use a safer subset or handle potential errors gracefully.
-             // For strict correctness, we should only add rules for paths that exist.
-             if !path.exists() {
-                 continue; 
-             }
-             
-             // ruleset = ruleset.add_rule(PathFd::new(path)?, *access)?;
+             // Apply the rule
+             // The Rust landlock crate uses `add_rule(path_fd, access)`.
+             ruleset = ruleset.add_rule(path_fd, *access).map_err(|e| anyhow::anyhow!("Failed to add Landlock rule for {:?}: {}", path, e))?;
         }
         
         let status = ruleset.restrict_self().map_err(|e| anyhow::anyhow!("Landlock restrict error: {}", e))?;
         
         if status.ruleset == landlock::RulesetStatus::NotEnforced {
-             // log warning
+             eprintln!("Warning: Landlock ruleset was not enforced! Kernel might not support Landlock.");
         }
 
         Ok(())
     }
 }
+

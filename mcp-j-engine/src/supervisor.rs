@@ -132,8 +132,44 @@ impl Supervisor {
     }
 
     fn setup_child(&self, sock: RawFd) -> Result<()> {
-        // 1. Unshare Namespaces (TODO: Implement full unshare)
-        // unshare(CloneFlags::CLONE_NEWNS | ...)?; 
+        // 1. Unshare Namespaces
+        // We unshare Mount, IPC, PID, Net, UTS namesapces.
+        // We DO NOT unshare User namespace here if we want to map it simply?
+        // Actually, to use Landlock effectively without privilege, we just need to be able to apply it.
+        // But for full isolation, creating a new User Namespace is best practice to drop real privileges.
+        
+        // However, setting up User Namespace requires writing to /proc/self/uid_map, which must be done
+        // by a parent or a privileged process *before* the child drops privileges or gives up context.
+        // If we unshare, we become root in the new namespace but user 'nobody' in the parent namespace logic.
+        // If we are already running as regular user, unshare(CLONE_NEWUSER) gives us full capa in the new namespace.
+        
+        // Unshare User namespace separately first to gain capabilities?
+        // Actually, unshare(CLONE_NEWUSER) implicitly sets other capabilities.
+        // It is often cleaner to unshare User first, map, then unshare others.
+        // But unshare() allows multiple flags.
+        // However, if we unshare(CLONE_NEWNS) without being root (or capacitated in user NS), it fails.
+        // So we MUST unshare CLONE_NEWUSER first if we are unprivileged.
+        
+        unshare(CloneFlags::CLONE_NEWUSER)?;
+
+        // Map UID/GID
+        let uid = unistd::getuid();
+        let gid = unistd::getgid();
+        std::fs::write("/proc/self/uid_map", format!("0 {} 1", uid))?;
+        std::fs::write("/proc/self/setgroups", "deny")?;
+        std::fs::write("/proc/self/gid_map", format!("0 {} 1", gid))?;
+        
+        // Now unshare the rest as the new root user in the new user namespace
+        unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWPID)?;
+        
+        // We need to mount proc for the new PID namespace to work properly if we fork again?
+        // But we are just execing.
+        // If we want ps to work, we need to mount proc.
+        // But for minimal jail, skipping proc mount is safer (no information leak).
+        // However, many tools expect /proc.
+        // Let's implement a minimal tmpfs mount on /tmp if possible, but keep it simple.
+
+
         
         // 2. Install Seccomp Filter and get Notify FD
         let notify_fd = self.install_seccomp_filter()?;

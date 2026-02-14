@@ -14,6 +14,12 @@ async fn main() {
     let cli = Cli::parse();
     
     println!("Launching jailed process: {:?}", cli.command);
+    
+    // Check kernel version
+    if let Err(e) = mcp_j_engine::check_kernel_compatibility() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
 
     // Initialize supervisor
     // We assume the first arg is the binary and the rest are args

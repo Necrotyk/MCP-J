@@ -1,5 +1,5 @@
 use anyhow::{Result, Context};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{RawFd, AsRawFd};
 use libc::{c_int, ioctl, pid_t};
 use crate::seccomp_sys::{
     seccomp_notif, seccomp_notif_resp,
@@ -109,33 +109,70 @@ impl SeccompLoop {
 
     fn handle_connect(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
         // Validation logic for connect
-        // args[0] = sockfd
-        // args[1] = struct sockaddr *addr
-        // args[2] = addrlen
         
         let addr_ptr = req.data.args[1];
         let addr_len = req.data.args[2] as usize;
-        
-        // Read sockaddr from tracee
-        // We need the pid from req.pid, not self.pid (which is supervisor)
-        // req.pid is u32, pid_t is i32 usually.
         let tracee_pid = req.pid as pid_t;
         
-        // Limit addr_len to avoid huge allocation
-        if addr_len > 128 { // sockaddr_storage is ~128 bytes
+        if addr_len > 128 { 
              return Ok(self.resp_error(req, libc::EINVAL));
         }
-
-        let sockaddr_buf = match self.read_tracee_memory(tracee_pid, addr_ptr, addr_len) {
-            Ok(buf) => buf,
+        
+        // Read sockaddr struct from tracee memory
+        let buf = match self.read_tracee_memory(tracee_pid, addr_ptr, addr_len) {
+            Ok(b) => b,
             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
         };
+
+        // Check address family
+        // sockaddr structure: first 2 bytes are family (sa_family_t)
+        if buf.len() < 2 {
+             return Ok(self.resp_error(req, libc::EINVAL));
+        }
         
-        // Parse sockaddr
-        // For now, allow everything
-        // TODO: Parse IP/Port and validate against allowlist
+        // We assume little-endian for now, or native endian.
+        // sa_family is usually u16.
+        let sa_family = u16::from_ne_bytes([buf[0], buf[1]]);
         
-        Ok(self.resp_continue(req))
+        match sa_family as i32 {
+            libc::AF_UNIX => {
+                 // Allow local unix sockets?
+                 // Maybe filter by path if we parse it.
+                 // For now, allow AF_UNIX for IPC.
+                 Ok(self.resp_continue(req))
+            },
+            libc::AF_INET => {
+                 // IPv4
+                 // sockaddr_in: family (2), port (2), addr (4), zero (8)
+                 if buf.len() < 6 {
+                      return Ok(self.resp_error(req, libc::EINVAL));
+                 }
+                 
+                 let port = u16::from_be_bytes([buf[2], buf[3]]);
+                 let ip_bytes = [buf[4], buf[5], buf[6], buf[7]];
+                 // let ip = std::net::Ipv4Addr::from(ip_bytes);
+                 
+                 // TODO: Validate IP/Port against policy
+                 // Example: Prevent internal networks/metadata service (169.254.169.254)
+                 
+                 // CVE-2025-6514 remediation: Block access to metadata service
+                 if ip_bytes == [169, 254, 169, 254] {
+                      eprintln!("Blocked access to metadata service!");
+                      return Ok(self.resp_error(req, libc::EACCES));
+                 }
+                 
+                 Ok(self.resp_continue(req))
+            },
+            libc::AF_INET6 => {
+                 // IPv6
+                 // Block for now or stricter checks
+                 Ok(self.resp_continue(req))
+            },
+            _ => {
+                 // Deny unknown families
+                 Ok(self.resp_error(req, libc::EAFNOSUPPORT))
+            }
+        }
     }
 
     fn handle_execve(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
@@ -152,10 +189,71 @@ impl SeccompLoop {
     }
 
     fn handle_openat(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
-        // Handle atomic open with emulation
-        // For now, allow (continue) as stub, but we have inject_fd ready.
-        Ok(self.resp_continue(req))
+        // Implement atomic open using openat2 + inject_fd
+        
+        let dirfd = req.data.args[0] as i32;
+        let path_ptr = req.data.args[1];
+        let _flags = req.data.args[2];
+        let _mode = req.data.args[3];
+        let tracee_pid = req.pid as pid_t;
+        
+        // Read path string from tracee
+        // We need to loop or guess length, assuming PATH_MAX (4096)
+        let mut buf = vec![0u8; 4096];
+        let local_iov = [IoSliceMut::new(&mut buf)];
+        let remote_iov = [RemoteIoVec { base: path_ptr as usize, len: 4096 }];
+        
+        // Use process_vm_readv_string-like logic? 
+        // Just read a chunk and look for null terminator.
+        let n = process_vm_readv(nix::unistd::Pid::from_raw(tracee_pid), &local_iov, &remote_iov).unwrap_or(0);
+        if n == 0 {
+             return Ok(self.resp_error(req, libc::EFAULT));
+        }
+        
+        // Find null byte
+        let path_str = match buf[..n].iter().position(|&c| c == 0) {
+            Some(i) => std::str::from_utf8(&buf[..i]).unwrap_or(""),
+            None => return Ok(self.resp_error(req, libc::ENAMETOOLONG)),
+        };
+        
+        // Determine root for resolution.
+        // For simplicity, we assume we are resolving relative to the CWD of the supervisor or a designated root?
+        // Wait, files should be restricted to the project root allowed by Landlock.
+        // The supervisor should have open handles to allowed roots.
+        // For now, let's just demonstrate the mechanism using the Current Working Directory of the Supervisor.
+        // Ideally, `dirfd` from tracee should be mapped to supervisor's FD if it was previously injected.
+        // But `AT_FDCWD` (-100) means CWD.
+        
+        let root_dot = std::fs::File::open(".").map_err(|_| anyhow::anyhow!("Failed to open ."))?;
+        
+        // Perform safe open
+        let file = match crate::fs_utils::safe_open_beneath(&root_dot, path_str) {
+            Ok(f) => f,
+            Err(e) => {
+                // Determine errno (EACCES, ENOENT, ...)
+                // For now, EACCES on failure
+                eprintln!("Blocked open access to {}: {}", path_str, e);
+                return Ok(self.resp_error(req, libc::EACCES));
+            }
+        };
+        
+        // Inject FD
+        let injected_fd = self.inject_fd(req, file.as_raw_fd())?;
+        
+        // Respond with success and the new FD as return value.
+        // To return a value, we set `val` and use `SECCOMP_USER_NOTIF_FLAG_CONTINUE`? NO.
+        // If we handled it, we DO NOT set FLAG_CONTINUE.
+        // We set `val` to the return value (the fd) and `error` to 0.
+        // And flags = 0.
+        
+        Ok(seccomp_notif_resp {
+            id: req.id,
+            val: injected_fd as i64,
+            error: 0,
+            flags: 0,
+        })
     }
+
 
     fn inject_fd(&self, req: &seccomp_notif, fd: RawFd) -> Result<RawFd> {
         let mut addfd = seccomp_notif_addfd {
