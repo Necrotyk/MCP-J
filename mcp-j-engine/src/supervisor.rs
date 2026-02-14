@@ -65,7 +65,8 @@ impl Supervisor {
 
                 // Start Seccomp Loop in background thread
                 let loop_root = self.project_root.clone();
-                let seccomp_loop = SeccompLoop::new(notify_fd, loop_root);
+                let allowed_cmd = self.command.clone();
+                let seccomp_loop = SeccompLoop::new(notify_fd, loop_root, allowed_cmd);
                 std::thread::spawn(move || {
                     if let Err(e) = seccomp_loop.run() {
                         eprintln!("Seccomp loop error: {}", e);
@@ -146,7 +147,25 @@ impl Supervisor {
     }
 
     fn setup_child(&self, sock: RawFd) -> Result<()> {
-
+        // --- PHASE 0: Cgroup v2 Resource Bounding ---
+        let pid = std::process::id();
+        let cgroup_path = PathBuf::from(format!("/sys/fs/cgroup/mcp-j-{}", pid));
+        
+        // Attempt to create cgroup and limit resource
+        // We do this before unsharing/pivoting so we see host /sys/fs/cgroup
+        if let Err(e) = std::fs::create_dir(&cgroup_path) {
+             eprintln!("Warning: Failed to create cgroup {}: {}. Resource limits might not be applied.", cgroup_path.display(), e);
+        } else {
+             // Add self to cgroup
+             if let Err(e) = std::fs::write(cgroup_path.join("cgroup.procs"), pid.to_string()) {
+                 eprintln!("Warning: Failed to add pid to cgroup: {}", e);
+             }
+             
+             // Set memory limit 512MB
+             if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), "536870912") {
+                 eprintln!("Warning: Failed to set memory limit: {}", e);
+             }
+        }
 
         // 1. Unshare Namespaces
         unshare(CloneFlags::CLONE_NEWUSER)?;

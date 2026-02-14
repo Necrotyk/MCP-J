@@ -16,11 +16,12 @@ use std::path::PathBuf;
 pub struct SeccompLoop {
     notify_fd: RawFd,
     project_root: PathBuf,
+    allowed_command: PathBuf,
 }
 
 impl SeccompLoop {
-    pub fn new(notify_fd: RawFd, project_root: PathBuf) -> Self {
-        Self { notify_fd, project_root }
+    pub fn new(notify_fd: RawFd, project_root: PathBuf, allowed_command: PathBuf) -> Self {
+        Self { notify_fd, project_root, allowed_command }
     }
 
     // Helper to read memory from the tracee
@@ -36,6 +37,58 @@ impl SeccompLoop {
             // anyhow::bail!("Partial read from tracee memory");
         }
         Ok(buf)
+    }
+
+    // Helper to read a string from tracee memory (page aligned)
+    fn read_string_tracee(&self, pid: pid_t, addr: u64) -> Result<String> {
+        let mut path_buf = Vec::new();
+        let max_len = 4096;
+        let page_size = 4096;
+        let mut current_addr = addr as usize;
+        
+        loop {
+            if path_buf.len() >= max_len {
+                return Err(anyhow::anyhow!("String too long"));
+            }
+            
+            // Calculate distance to next page boundary
+            let bytes_to_boundary = page_size - (current_addr % page_size);
+            let chunk_size = std::cmp::min(bytes_to_boundary, max_len - path_buf.len());
+            
+            let mut buf = vec![0u8; chunk_size];
+            let mut local_iov = [IoSliceMut::new(&mut buf)];
+            let remote_iov = [RemoteIoVec { base: current_addr, len: chunk_size }];
+            
+            let n = match process_vm_readv(nix::unistd::Pid::from_raw(pid), &mut local_iov, &remote_iov) {
+                Ok(n) => n,
+                Err(_) => {
+                    if path_buf.is_empty() { return Err(anyhow::anyhow!("Failed to read memory")); }
+                    0 
+                }
+            };
+            
+            if n == 0 && path_buf.is_empty() {
+                return Err(anyhow::anyhow!("Failed to read memory, 0 bytes"));
+            }
+            
+            let read_slice = &buf[..n];
+            if let Some(pos) = read_slice.iter().position(|&b| b == 0) {
+                path_buf.extend_from_slice(&read_slice[..pos]);
+                break;
+            } else {
+                path_buf.extend_from_slice(read_slice);
+                current_addr += n;
+                if n < chunk_size {
+                    // Partial read (EOF/EFAULT on remote?)
+                    // If we didn't find nul, and read less than expected, it's likely error unless string ends exactly at end of readable mapping without nul?
+                    // C strings must be nul terminated.
+                    return Err(anyhow::anyhow!("String not null terminated within readable memory"));
+                }
+            }
+        }
+
+        let s = std::str::from_utf8(&path_buf).map_err(|_| anyhow::anyhow!("Invalid UTF-8"))?;
+        Ok(s.to_string())
     }
 
     pub fn run(&self) -> Result<()> {
@@ -124,8 +177,6 @@ impl SeccompLoop {
              return Ok(self.resp_error(req, libc::EINVAL));
         }
         
-        // Read tracee memory. To be safe, read max expected size (e.g. sizeof(sockaddr_in6))
-        // or just `addr_len` if reasonable.
         if addr_len > 128 { // Max sockaddr size usually
              return Ok(self.resp_error(req, libc::EINVAL));
         }
@@ -135,33 +186,27 @@ impl SeccompLoop {
             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
         };
 
-        // Check address family
-        // sockaddr structure: first 2 bytes are family (sa_family_t)
-        // Ensure buf has enough bytes
         if buf.len() < 2 {
              return Ok(self.resp_error(req, libc::EINVAL));
         }
         
-        // Use native endian for sa_family_t (u16 usually)
-        // Proper way allows alignment, but we reduced to byte vec.
-        // We can cast using `align_to` but vec might not be aligned.
-        // Just reading bytes is safe.
         let sa_family = u16::from_ne_bytes([buf[0], buf[1]]);
         
         match sa_family as i32 {
             libc::AF_UNIX => {
+                 // Allow local unix sockets?
+                 // User didn't specify, but often needed.
+                 // "If local loopback is required... whitelist 127.0.0.1... drop all other routable address spaces".
+                 // AF_UNIX is local. I'll allow it for now or stick to strict interpretations.
+                 // "drop all other routable address spaces". UNIX isn't routable IP space.
                  Ok(self.resp_continue(req))
             },
             libc::AF_INET => {
-                 // IPv4: Validate size matches exact sockaddr_in
                  if addr_len != std::mem::size_of::<libc::sockaddr_in>() {
                       return Ok(self.resp_error(req, libc::EINVAL));
                  }
                  
-                 // Safe struct access
-                 // We copy bytes from buffer to a local struct to ensure alignment
                  let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-                 // unsafe copy: verify lengths match
                  if buf.len() < std::mem::size_of::<libc::sockaddr_in>() {
                      return Ok(self.resp_error(req, libc::EINVAL));
                  }
@@ -174,31 +219,22 @@ impl SeccompLoop {
                      );
                  }
                  
-                 // Access fields. Port and Addr are Network Byte Order (Big Endian)
-                 // Layout: sin_family, sin_port, sin_addr, sin_zero
-                 // libc::sockaddr_in::sin_port is u16 (be)
-                 // libc::sockaddr_in::sin_addr is struct in_addr { s_addr: u32 (be) }
-                 
-                 let port = u16::from_be(sin.sin_port);
                  let ip_raw = u32::from_be(sin.sin_addr.s_addr);
                  
-                 // Remediation: Block AWS metadata 169.254.169.254
-                 // 169.254.169.254 = 0xA9FEA9FE
-                 let metadata_ip: u32 = std::net::Ipv4Addr::new(169, 254, 169, 254).into();
+                 // Whitelist 127.0.0.1 (0x7F000001)
+                 let localhost: u32 = 0x7F000001;
                  
-                 if ip_raw == metadata_ip {
-                      eprintln!("Blocked access to metadata service (IPv4)!");
-                      return Ok(self.resp_error(req, libc::EACCES));
+                 if ip_raw == localhost {
+                      Ok(self.resp_continue(req))
+                 } else {
+                      eprintln!("Blocked outbound connection to IPv4: {:X}", ip_raw);
+                      Ok(self.resp_error(req, libc::EACCES))
                  }
-                 
-                 Ok(self.resp_continue(req))
             },
             libc::AF_INET6 => {
-                 // IPv6
-                 if addr_len != std::mem::size_of::<libc::sockaddr_in6>() {
-                      return Ok(self.resp_error(req, libc::EINVAL));
-                 }
-                 Ok(self.resp_continue(req))
+                 // Block all IPv6 as per instruction "Explicitly drop all other"
+                 eprintln!("Blocked outbound connection to IPv6");
+                 Ok(self.resp_error(req, libc::EACCES))
             },
             _ => {
                  // Deny unknown families
@@ -208,12 +244,33 @@ impl SeccompLoop {
     }
 
     fn handle_execve(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
-        // Prevent arbitrary execve
-        // Only allow if it matches specific patterns?
-        // Or if we are in expected state?
-        // Supervisor loop handles initial exec, subsequent execs might be dangerous.
-        // For now, allow.
-        Ok(self.resp_continue(req))
+        let ptr = req.data.args[0];
+        let tracee_pid = req.pid as pid_t;
+        
+        let path = match self.read_string_tracee(tracee_pid, ptr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to read execve path: {}", e);
+                return Ok(self.resp_error(req, libc::EFAULT));
+            }
+        };
+
+        // Strict whitelist: Allow only the original command
+        let allowed = self.allowed_command.to_string_lossy();
+        
+        // Normalize path?
+        // If path is typically absolute.
+        // We check if path == allowed OR path == <relative allowed>?
+        // For security, strict match.
+        // If allowed is "python3", but executed as "/usr/bin/python3", it might fail if we don't resolve.
+        // But for now, strict string equality is safest default-deny.
+        
+        if path == allowed {
+             Ok(self.resp_continue(req))
+        } else {
+             eprintln!("Blocked execve: {} != {}", path, allowed);
+             Ok(self.resp_error(req, libc::EACCES))
+        }
     }
 
     fn handle_bind(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
