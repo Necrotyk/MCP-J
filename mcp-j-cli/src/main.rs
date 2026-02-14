@@ -11,7 +11,9 @@ struct Cli {
 
 use mcp_j_proxy::JsonRpcProxy;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio::io::AsyncWriteExt;
+use futures::StreamExt; // For .next()
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,7 +35,6 @@ async fn main() -> anyhow::Result<()> {
     let mut child = supervisor.spawn()?;
 
     // Setup Proxy
-    // We use Arc to share the proxy validator between tasks
     let proxy = Arc::new(JsonRpcProxy::new());
     
     // Convert std files to tokio files
@@ -42,27 +43,45 @@ async fn main() -> anyhow::Result<()> {
     
     let mut async_child_stdin = tokio::fs::File::from_std(child_stdin);
     let async_child_stdout = tokio::fs::File::from_std(child_stdout);
-    let mut async_child_stdout_reader = BufReader::new(async_child_stdout);
     
-    let mut host_stdin_reader = BufReader::new(tokio::io::stdin());
+    let host_stdin = tokio::io::stdin();
     let mut host_stdout = tokio::io::stdout();
+
+    // Use strict memory bounding: 5MB max payload
+    let max_length = 5 * 1024 * 1024;
 
     // Inbound Task: Host Stdin -> Proxy -> Child Stdin
     let proxy_in = proxy.clone();
     let inbound_task = tokio::spawn(async move {
-        let mut line = String::new();
-        while host_stdin_reader.read_line(&mut line).await? > 0 {
-            match proxy_in.validate_and_parse(&line) {
-                Ok(_) => {
-                    // Validated, forward raw line
-                    async_child_stdin.write_all(line.as_bytes()).await?;
-                    async_child_stdin.flush().await?;
+        let codec = LinesCodec::new_with_max_length(max_length);
+        let mut framed_stdin = FramedRead::new(host_stdin, codec);
+
+        while let Some(line_result) = framed_stdin.next().await {
+            match line_result {
+                Ok(line) => {
+                    match proxy_in.validate_and_parse(&line) {
+                        Ok(v) => {
+                             // Serialize back to raw line
+                             // Wait, validation returns Value, we could re-serialize
+                             // or just forward the original string if clean.
+                             // `validate_and_parse` parses to Value.
+                             // To be safe and canonical, let's re-serialize.
+                             let mut raw = serde_json::to_string(&v)?;
+                             raw.push('\n');
+                             async_child_stdin.write_all(raw.as_bytes()).await?;
+                             async_child_stdin.flush().await?;
+                        }
+                        Err(e) => {
+                            eprintln!("Proxy Blocked Inbound: {}", e);
+                            // Do not forward
+                        }
+                    }
                 }
                 Err(e) => {
-                    eprintln!("Proxy Blocked Inbound: {}", e);
+                     eprintln!("Framing Error (Inbound): {}", e);
+                     break;
                 }
             }
-            line.clear();
         }
         Ok::<(), anyhow::Error>(())
     });
@@ -70,18 +89,30 @@ async fn main() -> anyhow::Result<()> {
     // Outbound Task: Child Stdout -> Proxy -> Host Stdout
     let proxy_out = proxy.clone();
     let outbound_task = tokio::spawn(async move {
-        let mut line = String::new();
-        while async_child_stdout_reader.read_line(&mut line).await? > 0 {
-            match proxy_out.validate_and_parse(&line) {
-                Ok(_) => {
-                    host_stdout.write_all(line.as_bytes()).await?;
-                    host_stdout.flush().await?;
+        let codec = LinesCodec::new_with_max_length(max_length);
+        let mut framed_child_stdout = FramedRead::new(async_child_stdout, codec);
+
+        while let Some(line_result) = framed_child_stdout.next().await {
+            match line_result {
+                Ok(line) => {
+                    match proxy_out.validate_and_parse(&line) {
+                         Ok(v) => {
+                             // Re-serialize strictly
+                             let mut raw = serde_json::to_string(&v)?;
+                             raw.push('\n');
+                             host_stdout.write_all(raw.as_bytes()).await?;
+                             host_stdout.flush().await?;
+                         }
+                         Err(e) => {
+                             eprintln!("Proxy Blocked Outbound: {}", e);
+                         }
+                    }
                 }
                 Err(e) => {
-                    eprintln!("Proxy Blocked Outbound: {}", e);
+                     eprintln!("Framing Error (Outbound): {}", e);
+                     break;
                 }
             }
-            line.clear();
         }
         Ok::<(), anyhow::Error>(())
     });

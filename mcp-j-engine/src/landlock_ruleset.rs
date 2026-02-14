@@ -1,14 +1,15 @@
 use landlock::{
-    AccessFs, Ruleset, RulesetError, ABI,
-    PathFd,
+    Access, AccessFs, Ruleset, RulesetError, ABI, RulesetStatus, RulesetAttr, RulesetCreatedAttr,
+    PathBeneath
 };
 use std::collections::HashMap;
 use anyhow::{Result, Context};
 use std::path::PathBuf;
+use enumflags2::BitFlags;
 
 #[derive(Clone)]
 pub struct LandlockRuleset {
-    allowed_paths: HashMap<PathBuf, AccessFs>,
+    allowed_paths: HashMap<PathBuf, BitFlags<AccessFs>>,
 }
 
 impl LandlockRuleset {
@@ -19,57 +20,47 @@ impl LandlockRuleset {
     }
 
     pub fn allow_read<P: Into<PathBuf>>(mut self, path: P) -> Self {
-        self.allowed_paths.insert(path.into(), AccessFs::from_read(ABI::V1));
+        let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+        self.allowed_paths.insert(path.into(), access);
         self
     }
 
     pub fn allow_write<P: Into<PathBuf>>(mut self, path: P) -> Self {
-        // Read + Write usually
-        let access = AccessFs::from_read(ABI::V1) | AccessFs::from_write(ABI::V1);
+        let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute | AccessFs::WriteFile | AccessFs::RemoveDir | AccessFs::RemoveFile | AccessFs::MakeChar | AccessFs::MakeDir | AccessFs::MakeReg | AccessFs::MakeSock | AccessFs::MakeFifo | AccessFs::MakeBlock | AccessFs::MakeSym;
         self.allowed_paths.insert(path.into(), access);
         self
     }
 
     pub fn apply(&self) -> Result<()> {
-        // ABI V4 supports more features (e.g. truncate), use best effort or specific version?
-        // Let's rely on the crate's robust handling or defaulting.
-        // The landlock crate's `Ruleset::new()` typically picks the highest supported ABI by default 
-        // or allows configuration.
-        // We'll try to use a recent ABI if available, but fallback handling is good.
-        let abi = ABI::V4; 
+        let abi = ABI::V4;
         
-        let mut ruleset = Ruleset::new()
+        let mut ruleset = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))?
             .create()?;
 
         for (path, access) in &self.allowed_paths {
-             // We need to resolve path to PathFd or use Path directly if crate supports it.
-             // landlock crate 0.4 `add_rule` takes `PathFd` which handles opening the path.
-             // We must handle the case where path doesn't exist (skip or error?)
-             // For strictness, if a configured allowed path is missing, arguably we should warn but proceed,
-             // or fail. Let's warn and continue to allow flexible configs.
+             if !path.exists() {
+                 continue;
+             }
              
-             let path_fd = match PathFd::new(path) {
-                 Ok(fd) => fd,
-                 Err(e) => {
-                     // Log warning? 
-                     eprintln!("Warning: Failed to resolve path for Landlock rule: {:?} - {}", path, e);
-                     continue;
-                 }
-             };
+             // Open the path to get an FD (AsFd)
+             let file = std::fs::File::open(path)
+                 .map_err(|e| anyhow::anyhow!("Failed to open path for landlock {:?}: {}", path, e))?;
+                 
+             let rule = PathBeneath::new(&file, *access);
              
-             // Apply the rule
-             // The Rust landlock crate uses `add_rule(path_fd, access)`.
-             ruleset = ruleset.add_rule(path_fd, *access).map_err(|e| anyhow::anyhow!("Failed to add Landlock rule for {:?}: {}", path, e))?;
+             ruleset = ruleset.add_rule(rule)
+                 .map_err(|e| anyhow::anyhow!("Failed to add Landlock rule for {:?}: {}", path, e))?;
         }
         
         let status = ruleset.restrict_self().map_err(|e| anyhow::anyhow!("Landlock restrict error: {}", e))?;
         
-        if status.ruleset == landlock::RulesetStatus::NotEnforced {
+        if status.ruleset == RulesetStatus::NotEnforced {
              eprintln!("Warning: Landlock ruleset was not enforced! Kernel might not support Landlock.");
         }
 
         Ok(())
     }
 }
+
 

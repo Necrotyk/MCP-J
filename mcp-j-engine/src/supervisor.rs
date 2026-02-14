@@ -4,6 +4,7 @@ use std::os::unix::process::CommandExt;
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::{self, ForkResult};
 use nix::sys::wait::{waitpid, WaitStatus};
+use std::os::unix::io::{AsRawFd, IntoRawFd, FromRawFd, RawFd};
 use anyhow::{Result, Context};
 use crate::landlock_ruleset::LandlockRuleset;
 use crate::seccomp_loop::SeccompLoop;
@@ -52,18 +53,17 @@ impl Supervisor {
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
                 // Parent process
-                unistd::close(child_sock).ok(); 
-                unistd::close(stdin_read).ok();
-                unistd::close(stdout_write).ok();
+                unistd::close(child_sock.as_raw_fd()).ok(); 
+                unistd::close(stdin_read.as_raw_fd()).ok();
+                unistd::close(stdout_write.as_raw_fd()).ok();
                 
                 println!("Supervisor: Started child with PID {}", child);
 
                 // Receive the notification FD from child
-                let notify_fd = self.receive_notify_fd(parent_sock)?;
-                unistd::close(parent_sock).ok(); 
+                let notify_fd = self.receive_notify_fd(parent_sock.as_raw_fd())?;
+                unistd::close(parent_sock.as_raw_fd()).ok(); 
 
                 // Start Seccomp Loop in background thread
-                // Pass project_root for relative path resolution policy if needed
                 let loop_root = self.project_root.clone();
                 let seccomp_loop = SeccompLoop::new(notify_fd, loop_root);
                 std::thread::spawn(move || {
@@ -72,8 +72,9 @@ impl Supervisor {
                     }
                 });
                 
-                let stdin_file = unsafe { std::fs::File::from_raw_fd(stdin_write) };
-                let stdout_file = unsafe { std::fs::File::from_raw_fd(stdout_read) };
+                // Use unsafe to create File from OwnedFd (by taking raw fd)
+                let stdin_file = unsafe { std::fs::File::from_raw_fd(stdin_write.into_raw_fd()) };
+                let stdout_file = unsafe { std::fs::File::from_raw_fd(stdout_read.into_raw_fd()) };
 
                 Ok(JailedChild {
                     pid: child,
@@ -83,19 +84,27 @@ impl Supervisor {
             }
             Ok(ForkResult::Child) => {
                 // Child process
-                unistd::close(parent_sock).ok();
+                unistd::close(parent_sock.as_raw_fd()).ok();
                 
-                // Setup redirection
-                unistd::close(stdin_write).ok(); // Close parent end
-                unistd::close(stdout_read).ok();
-                
-                let _ = unistd::dup2(stdin_read, 0); // Stdin
-                let _ = unistd::dup2(stdout_write, 1); // Stdout
-                
-                unistd::close(stdin_read).ok();
-                unistd::close(stdout_write).ok();
+                // Convert OwnedFds to RawFds to manage manually
+                let stdin_r_fd = stdin_read.into_raw_fd();
+                let stdin_w_fd = stdin_write.into_raw_fd();
+                let stdout_r_fd = stdout_read.into_raw_fd();
+                let stdout_w_fd = stdout_write.into_raw_fd();
 
-                if let Err(e) = self.setup_child(child_sock) {
+                // Close unused ends
+                unistd::close(stdin_w_fd).ok(); 
+                unistd::close(stdout_r_fd).ok();
+                
+                // Dup2
+                let _ = unistd::dup2(stdin_r_fd, 0); // Stdin
+                let _ = unistd::dup2(stdout_w_fd, 1); // Stdout
+                
+                // Close original FDs
+                unistd::close(stdin_r_fd).ok();
+                unistd::close(stdout_w_fd).ok();
+
+                if let Err(e) = self.setup_child(child_sock.as_raw_fd()) {
                     eprintln!("Child setup failed: {}", e);
                     std::process::exit(1);
                 }
@@ -113,6 +122,171 @@ impl Supervisor {
             }
         }
     }
+
+    fn receive_notify_fd(&self, sock: RawFd) -> Result<RawFd> {
+        use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned};
+        use std::io::IoSliceMut;
+
+        let mut buf = [0u8; 1];
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        let mut cmsg_buffer = nix::cmsg_space!(RawFd);
+        
+        // Blocking recv
+        let msg = recvmsg::<()>(sock, &mut iov, Some(&mut cmsg_buffer), MsgFlags::empty())?;
+        
+        let fd = msg.cmsgs().map(|mut iter| iter.find_map(|cmsg| {
+            match cmsg {
+                ControlMessageOwned::ScmRights(fds) => fds.first().cloned(),
+                _ => None,
+            }
+        }))? 
+        .ok_or_else(|| anyhow::anyhow!("No FD received from child"))?;
+
+        Ok(fd)
+    }
+
+    fn setup_child(&self, sock: RawFd) -> Result<()> {
+
+
+        // 1. Unshare Namespaces
+        unshare(CloneFlags::CLONE_NEWUSER)?;
+
+        // Map UID/GID
+        let uid = unistd::getuid();
+        let gid = unistd::getgid();
+        std::fs::write("/proc/self/uid_map", format!("0 {} 1", uid))?;
+        std::fs::write("/proc/self/setgroups", "deny")?;
+        std::fs::write("/proc/self/gid_map", format!("0 {} 1", gid))?;
+        
+        // Now unshare the rest
+        unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWPID)?;
+        
+        // Mount setup
+        use nix::mount::{mount, umount2, MsFlags, MntFlags};
+        
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+            None::<&str>,
+        ).context("Failed to make / private")?;
+
+        mount(
+            Some("tmpfs"),
+            "/tmp",
+            Some("tmpfs"),
+            MsFlags::empty(),
+            Some("mode=1777,size=64m"),
+        ).context("Failed to mount tmpfs on /tmp")?;
+        
+        // --- PHASE 3: Pivot Root ---
+        let jail_root = std::path::Path::new("/tmp/jail_root");
+        if !jail_root.exists() {
+            std::fs::create_dir(jail_root).context("Failed to create jail root")?;
+        }
+        
+        let workspace_path = jail_root.join("workspace");
+        if !workspace_path.exists() {
+            std::fs::create_dir(&workspace_path).context("Failed to create workspace in jail")?;
+        }
+        
+        mount(
+             Some(&self.project_root),
+             &workspace_path,
+             None::<&str>,
+             MsFlags::MS_BIND | MsFlags::MS_REC,
+             None::<&str>,
+        ).context("Failed to bind mount project root")?;
+        
+        for dir in ["bin", "lib", "lib64", "usr"] {
+            let src = PathBuf::from("/").join(dir);
+            let dst = jail_root.join(dir);
+            if src.exists() {
+                if !dst.exists() { std::fs::create_dir(&dst).ok(); }
+                mount(
+                    Some(&src),
+                    &dst,
+                    None::<&str>,
+                    MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY,
+                    None::<&str>
+                ).ok(); 
+            }
+        }
+        
+        let old_root = jail_root.join("old_root");
+        if !old_root.exists() {
+            std::fs::create_dir(&old_root).context("Failed to create old_root")?;
+        }
+        
+        mount(
+             Some(jail_root),
+             jail_root,
+             None::<&str>,
+             MsFlags::MS_BIND,
+             None::<&str>
+        ).context("Failed to bind mount jail root to itself")?;
+        
+        nix::unistd::pivot_root(jail_root, &old_root).context("Failed to pivot root")?;
+        
+        unistd::chdir("/").context("Failed to chdir to new root")?;
+        
+        umount2("/old_root", MntFlags::MNT_DETACH).context("Failed to unmount old_root")?;
+        
+        std::fs::remove_dir("/old_root").ok();
+        
+        unistd::chdir("/workspace").context("Failed to chdir to workspace")?;
+
+        // --- PHASE 2: Capability Dropping ---
+        for cap in 0..=63 {
+             unsafe {
+                 libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+             }
+        }
+        
+        // 2. Install Seccomp Filter and get Notify FD
+        let notify_fd = self.install_seccomp_filter()?;
+        
+        // 3. Send Notify FD to parent
+        self.send_notify_fd(sock, notify_fd)?;
+        
+        // 4. Close Notify FD and Socket in child
+        unistd::close(notify_fd).ok();
+        unistd::close(sock).ok();
+        
+        // 5. Apply Landlock 
+        self.landlock_ruleset.apply().context("Failed to apply Landlock rules")?;
+        
+        Ok(())
+    }
+
+    fn send_notify_fd(&self, sock: RawFd, fd: RawFd) -> Result<()> {
+        use nix::sys::socket::{sendmsg, MsgFlags, ControlMessage};
+        use std::io::IoSlice;
+
+        let buf = [0u8; 1];
+        let iov = [IoSlice::new(&buf)];
+        let fds = [fd];
+        let cmsg = ControlMessage::ScmRights(&fds);
+        
+        sendmsg::<()>(sock, &iov, &[cmsg], MsgFlags::empty(), None)?;
+        Ok(())
+    }
+
+    fn install_seccomp_filter(&self) -> Result<RawFd> {
+        use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall};
+        
+        let mut ctx = ScmpFilterContext::new(ScmpAction::Allow)?;
+        
+        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("connect")?)?;
+        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("execve")?)?;
+        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("bind")?)?;
+        
+        ctx.load()?;
+        
+        let fd = ctx.get_notify_fd()?;
+        Ok(fd)
+    }
 }
 
 pub struct JailedChild {
@@ -125,169 +299,4 @@ impl JailedChild {
     pub fn wait(&mut self) -> Result<WaitStatus> {
         waitpid(self.pid, None).map_err(|e| anyhow::anyhow!("waitpid failed: {}", e))
     }
-
-    fn receive_notify_fd(&self, sock: RawFd) -> Result<RawFd> {
-        use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned};
-        use nix::sys::uio::IoVec;
-
-        let mut buf = [0u8; 1];
-        let iov = [IoVec::from_slice(&buf)];
-        let mut cmsg_buffer = nix::cmsg_space!(RawFd);
-        
-        // Blocking recv
-        let msg = recvmsg(sock, &iov, Some(&mut cmsg_buffer), MsgFlags::empty())?;
-        
-        let fd = msg.cmsgs().find_map(|cmsg| {
-            match cmsg {
-                ControlMessageOwned::ScmRights(fds) => fds.first().cloned(),
-                _ => None,
-            }
-        }).ok_or_else(|| anyhow::anyhow!("No FD received from child"))?;
-
-        Ok(fd)
-    }
-
-
-    fn setup_child(&self, sock: RawFd) -> Result<()> {
-        // 1. Unshare Namespaces
-        // We unshare Mount, IPC, PID, Net, UTS namesapces.
-        // We DO NOT unshare User namespace here if we want to map it simply?
-        // Actually, to use Landlock effectively without privilege, we just need to be able to apply it.
-        // But for full isolation, creating a new User Namespace is best practice to drop real privileges.
-        
-        // However, setting up User Namespace requires writing to /proc/self/uid_map, which must be done
-        // by a parent or a privileged process *before* the child drops privileges or gives up context.
-        // If we unshare, we become root in the new namespace but user 'nobody' in the parent namespace logic.
-        // If we are already running as regular user, unshare(CLONE_NEWUSER) gives us full capa in the new namespace.
-        
-        // Unshare User namespace separately first to gain capabilities?
-        // Actually, unshare(CLONE_NEWUSER) implicitly sets other capabilities.
-        // It is often cleaner to unshare User first, map, then unshare others.
-        // But unshare() allows multiple flags.
-        // However, if we unshare(CLONE_NEWNS) without being root (or capacitated in user NS), it fails.
-        // So we MUST unshare CLONE_NEWUSER first if we are unprivileged.
-        
-        unshare(CloneFlags::CLONE_NEWUSER)?;
-
-        // Map UID/GID
-        let uid = unistd::getuid();
-        let gid = unistd::getgid();
-        std::fs::write("/proc/self/uid_map", format!("0 {} 1", uid))?;
-        std::fs::write("/proc/self/setgroups", "deny")?;
-        std::fs::write("/proc/self/gid_map", format!("0 {} 1", gid))?;
-        
-        // Now unshare the rest as the new root user in the new user namespace
-        unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWPID)?;
-        
-        // Mount setup
-        // 1. Mark propagation as private
-        // MS_REC | MS_PRIVATE
-        use nix::mount::{mount, MsFlags};
-        
-        // We need to ensure we have the "mount" feature in nix.
-        // Assuming it is available or I will add it.
-        
-        mount(
-            None::<&str>,
-            "/",
-            None::<&str>,
-            MsFlags::MS_PRIVATE | MsFlags::MS_REC,
-            None::<&str>,
-        ).context("Failed to make / private")?;
-
-        // 2. Mount tmpfs on /tmp
-        // We need to ensure /tmp exists? It likely does.
-        mount(
-            Some("tmpfs"),
-            "/tmp",
-            Some("tmpfs"),
-            MsFlags::empty(),
-            Some("mode=1777,size=64m"),
-        ).context("Failed to mount tmpfs on /tmp")?;
-        
-        // 3. Proc? 
-        // If we want to hide processes, we DO NOT mount proc.
-        // If the tool needs it, we mount it.
-        // Spec says "minimal jail", usually implies no /proc if possible.
-        // Or mount a fresh proc instance:
-        // mount(Some("proc"), "/proc", Some("proc"), MsFlags::empty(), None)?;
-        // Let's explicitly NOT mount proc for now to prevent info leaks.
-
-
-
-        
-        // 2. Install Seccomp Filter and get Notify FD
-        let notify_fd = self.install_seccomp_filter()?;
-        
-        // 3. Send Notify FD to parent
-        self.send_notify_fd(sock, notify_fd)?;
-        
-        // 4. Close Notify FD and Socket in child
-        unistd::close(notify_fd).ok();
-        unistd::close(sock).ok();
-
-        // 5. Apply Landlock (Last step before exec usually, or before seccomp?)
-        
-        // Ensure we are in the project root
-        // This is important for relative paths if the user code relies on it.
-        std::env::set_current_dir(&self.project_root).context("Failed to set current directory to project root")?;
-
-        // Landlock should be applied.
-        self.landlock_ruleset.apply().context("Failed to apply Landlock rules")?;
-
-        Ok(())
-    }
-
-    fn send_notify_fd(&self, sock: RawFd, fd: RawFd) -> Result<()> {
-        use nix::sys::socket::{sendmsg, MsgFlags, ControlMessage};
-        use nix::sys::uio::IoVec;
-
-        let buf = [0u8; 1];
-        let iov = [IoVec::from_slice(&buf)];
-        let fds = [fd];
-        let cmsg = ControlMessage::ScmRights(&fds);
-        
-        sendmsg(sock, &iov, &[cmsg], MsgFlags::empty(), None)?;
-        Ok(())
-    }
-
-    fn install_seccomp_filter(&self) -> Result<RawFd> {
-        // Use libseccomp or raw syscall to install filter with SECCOMP_RET_USER_NOTIF
-        // For now, let's assume we use a specialized crate or helper.
-        // Since I cannot trust crate availability, I'll use a placeholder that
-        // effectively does nothing or mocks it, UNLESS I found libseccomp works.
-        // But for "carry on", I must implement it.
-        
-        // NOTE: Without a working libseccomp crate, creating BPF is hard.
-        // user previously added `libseccomp` to Cargo.toml.
-        // Let's assume `libseccomp` crate is available.
-        
-        use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall};
-        
-        // Create filter: Default Action = Allow (for now, to test flow).
-        // Spec says: Default Default = Deny? No, spec "Ruleset Specification" says landlock default deny.
-        // Seccomp spec says "Intercept ... Allow (Conditional)".
-        // Ideally: Default Allow, Intercept specific.
-        
-        let mut ctx = ScmpFilterContext::new_filter(ScmpAction::Allow)?;
-        
-        // Add rule to intercept CONNECT
-        // Note: `ScmpAction::Notify` matches `SECCOMP_RET_USER_NOTIF`.
-        // If crate doesn't have Notify, we are stuck.
-        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("connect")?)?;
-        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("execve")?)?;
-        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("bind")?)?;
-        
-        ctx.load()?;
-        
-        // Get the notification FD. 
-        // libseccomp crate implementation of `get_notify_fd`?
-        // If not available, we might need to use `check_version` or `export_bpf` and load manually?
-        // `libseccomp` > 2.5 has `get_notify_fd()`.
-        
-        // Assuming:
-        let fd = ctx.get_notify_fd()?;
-        Ok(fd)
-    }
-
 }

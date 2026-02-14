@@ -12,6 +12,7 @@ use std::io::IoSliceMut;
 
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct SeccompLoop {
     notify_fd: RawFd,
     project_root: PathBuf,
@@ -24,11 +25,12 @@ impl SeccompLoop {
 
     // Helper to read memory from the tracee
     fn read_tracee_memory(&self, pid: pid_t, addr: u64, len: usize) -> Result<Vec<u8>> {
+        
         let mut buf = vec![0u8; len];
-        let local_iov = [IoSliceMut::new(&mut buf)];
+        let mut local_iov = [IoSliceMut::new(&mut buf)];
         let remote_iov = [RemoteIoVec { base: addr as usize, len }];
         
-        let n = process_vm_readv(nix::unistd::Pid::from_raw(pid), &local_iov, &remote_iov)?;
+        let n = process_vm_readv(nix::unistd::Pid::from_raw(pid), &mut local_iov, &remote_iov)?;
         if n != len {
             // Partial read?
             // anyhow::bail!("Partial read from tracee memory");
@@ -117,11 +119,17 @@ impl SeccompLoop {
         let addr_len = req.data.args[2] as usize;
         let tracee_pid = req.pid as pid_t;
         
-        if addr_len > 128 { 
+        // Strict length checking for known families
+        if addr_len < std::mem::size_of::<libc::sa_family_t>() {
              return Ok(self.resp_error(req, libc::EINVAL));
         }
         
-        // Read sockaddr struct from tracee memory
+        // Read tracee memory. To be safe, read max expected size (e.g. sizeof(sockaddr_in6))
+        // or just `addr_len` if reasonable.
+        if addr_len > 128 { // Max sockaddr size usually
+             return Ok(self.resp_error(req, libc::EINVAL));
+        }
+
         let buf = match self.read_tracee_memory(tracee_pid, addr_ptr, addr_len) {
             Ok(b) => b,
             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
@@ -129,38 +137,57 @@ impl SeccompLoop {
 
         // Check address family
         // sockaddr structure: first 2 bytes are family (sa_family_t)
+        // Ensure buf has enough bytes
         if buf.len() < 2 {
              return Ok(self.resp_error(req, libc::EINVAL));
         }
         
-        // We assume little-endian for now, or native endian.
-        // sa_family is usually u16.
+        // Use native endian for sa_family_t (u16 usually)
+        // Proper way allows alignment, but we reduced to byte vec.
+        // We can cast using `align_to` but vec might not be aligned.
+        // Just reading bytes is safe.
         let sa_family = u16::from_ne_bytes([buf[0], buf[1]]);
         
         match sa_family as i32 {
             libc::AF_UNIX => {
-                 // Allow local unix sockets?
-                 // Maybe filter by path if we parse it.
-                 // For now, allow AF_UNIX for IPC.
                  Ok(self.resp_continue(req))
             },
             libc::AF_INET => {
-                 // IPv4
-                 // sockaddr_in: family (2), port (2), addr (4), zero (8)
-                 if buf.len() < 6 {
+                 // IPv4: Validate size matches exact sockaddr_in
+                 if addr_len != std::mem::size_of::<libc::sockaddr_in>() {
                       return Ok(self.resp_error(req, libc::EINVAL));
                  }
                  
-                 let port = u16::from_be_bytes([buf[2], buf[3]]);
-                 let ip_bytes = [buf[4], buf[5], buf[6], buf[7]];
-                 // let ip = std::net::Ipv4Addr::from(ip_bytes);
+                 // Safe struct access
+                 // We copy bytes from buffer to a local struct to ensure alignment
+                 let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                 // unsafe copy: verify lengths match
+                 if buf.len() < std::mem::size_of::<libc::sockaddr_in>() {
+                     return Ok(self.resp_error(req, libc::EINVAL));
+                 }
                  
-                 // TODO: Validate IP/Port against policy
-                 // Example: Prevent internal networks/metadata service (169.254.169.254)
+                 unsafe {
+                     std::ptr::copy_nonoverlapping(
+                         buf.as_ptr(), 
+                         &mut sin as *mut _ as *mut u8, 
+                         std::mem::size_of::<libc::sockaddr_in>()
+                     );
+                 }
                  
-                 // CVE-2025-6514 remediation: Block access to metadata service
-                 if ip_bytes == [169, 254, 169, 254] {
-                      eprintln!("Blocked access to metadata service!");
+                 // Access fields. Port and Addr are Network Byte Order (Big Endian)
+                 // Layout: sin_family, sin_port, sin_addr, sin_zero
+                 // libc::sockaddr_in::sin_port is u16 (be)
+                 // libc::sockaddr_in::sin_addr is struct in_addr { s_addr: u32 (be) }
+                 
+                 let port = u16::from_be(sin.sin_port);
+                 let ip_raw = u32::from_be(sin.sin_addr.s_addr);
+                 
+                 // Remediation: Block AWS metadata 169.254.169.254
+                 // 169.254.169.254 = 0xA9FEA9FE
+                 let metadata_ip: u32 = std::net::Ipv4Addr::new(169, 254, 169, 254).into();
+                 
+                 if ip_raw == metadata_ip {
+                      eprintln!("Blocked access to metadata service (IPv4)!");
                       return Ok(self.resp_error(req, libc::EACCES));
                  }
                  
@@ -168,7 +195,9 @@ impl SeccompLoop {
             },
             libc::AF_INET6 => {
                  // IPv6
-                 // Block for now or stricter checks
+                 if addr_len != std::mem::size_of::<libc::sockaddr_in6>() {
+                      return Ok(self.resp_error(req, libc::EINVAL));
+                 }
                  Ok(self.resp_continue(req))
             },
             _ => {
@@ -212,10 +241,10 @@ impl SeccompLoop {
             let chunk_size = std::cmp::min(bytes_to_boundary, max_len - path_buf.len());
             
             let mut buf = vec![0u8; chunk_size];
-            let local_iov = [IoSliceMut::new(&mut buf)];
+            let mut local_iov = [IoSliceMut::new(&mut buf)];
             let remote_iov = [RemoteIoVec { base: current_addr, len: chunk_size }];
             
-            let n = match process_vm_readv(nix::unistd::Pid::from_raw(tracee_pid), &local_iov, &remote_iov) {
+            let n = match process_vm_readv(nix::unistd::Pid::from_raw(tracee_pid), &mut local_iov, &remote_iov) {
                 Ok(n) => n,
                 Err(_) => {
                     if path_buf.is_empty() { return Ok(self.resp_error(req, libc::EFAULT)); }
@@ -253,14 +282,16 @@ impl SeccompLoop {
              std::fs::File::open(&self.project_root).map_err(|e| anyhow::anyhow!("Failed to open root {:?}: {}", self.project_root, e))?
         } else {
              // Use pidfd_open + pidfd_getfd
-             let pidfd = unsafe { libc::syscall(crate::seccomp_sys::SYS_pidfd_open, tracee_pid, 0) };
+             let pidfd = unsafe { libc::syscall(crate::seccomp_sys::SYS_PIDFD_OPEN, tracee_pid, 0) };
              if pidfd < 0 {
                  let err = std::io::Error::last_os_error();
                  eprintln!("pidfd_open failed: {}", err);
-                 return Ok(self.resp_error(req, libc::ESRCH));
+                 // If pidfd_open is blocked or fails, we might want to fail the request or continue with fallback?
+                 // But for strict security, we fail.
+                 return Ok(self.resp_error(req, 0-libc::ESRCH)); 
              }
              
-             let dup_fd = unsafe { libc::syscall(crate::seccomp_sys::SYS_pidfd_getfd, pidfd, dirfd, 0) };
+             let dup_fd = unsafe { libc::syscall(crate::seccomp_sys::SYS_PIDFD_GETFD, pidfd, dirfd, 0) };
              unsafe { libc::close(pidfd as i32) };
              
              if dup_fd < 0 {
