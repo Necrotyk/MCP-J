@@ -90,4 +90,7 @@ pub struct seccomp_notif_addfd {
     pub newfd_flags: u32,
 }
 
+pub const SYS_pidfd_open: c_long = 434;
+pub const SYS_pidfd_getfd: c_long = 438;
+
 

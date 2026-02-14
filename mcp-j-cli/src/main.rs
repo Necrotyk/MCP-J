@@ -25,8 +25,9 @@ async fn main() -> anyhow::Result<()> {
     // Initialize supervisor
     let binary = std::path::PathBuf::from(&cli.command[0]);
     let args = cli.command[1..].to_vec();
+    let project_root = std::env::current_dir()?;
 
-    let supervisor = Supervisor::new(binary, args)?;
+    let supervisor = Supervisor::new(binary, args, project_root)?;
     
     // Spawn child
     let mut child = supervisor.spawn()?;

@@ -12,14 +12,16 @@ pub struct Supervisor {
     command: PathBuf,
     args: Vec<String>,
     landlock_ruleset: LandlockRuleset,
+    project_root: PathBuf,
 }
 
 impl Supervisor {
-    pub fn new(command: PathBuf, args: Vec<String>) -> Result<Self> {
+    pub fn new(command: PathBuf, args: Vec<String>, project_root: PathBuf) -> Result<Self> {
         Ok(Self {
             command,
             args,
             landlock_ruleset: LandlockRuleset::new()?,
+            project_root,
         })
     }
 
@@ -61,7 +63,9 @@ impl Supervisor {
                 unistd::close(parent_sock).ok(); 
 
                 // Start Seccomp Loop in background thread
-                let seccomp_loop = SeccompLoop::new(notify_fd);
+                // Pass project_root for relative path resolution policy if needed
+                let loop_root = self.project_root.clone();
+                let seccomp_loop = SeccompLoop::new(notify_fd, loop_root);
                 std::thread::spawn(move || {
                     if let Err(e) = seccomp_loop.run() {
                         eprintln!("Seccomp loop error: {}", e);
@@ -143,6 +147,7 @@ impl JailedChild {
         Ok(fd)
     }
 
+
     fn setup_child(&self, sock: RawFd) -> Result<()> {
         // 1. Unshare Namespaces
         // We unshare Mount, IPC, PID, Net, UTS namesapces.
@@ -222,6 +227,11 @@ impl JailedChild {
         unistd::close(sock).ok();
 
         // 5. Apply Landlock (Last step before exec usually, or before seccomp?)
+        
+        // Ensure we are in the project root
+        // This is important for relative paths if the user code relies on it.
+        std::env::set_current_dir(&self.project_root).context("Failed to set current directory to project root")?;
+
         // Landlock should be applied.
         self.landlock_ruleset.apply().context("Failed to apply Landlock rules")?;
 

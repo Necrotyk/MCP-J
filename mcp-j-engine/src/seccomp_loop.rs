@@ -10,13 +10,16 @@ use crate::seccomp_sys::{
 use nix::sys::uio::{process_vm_readv, RemoteIoVec};
 use std::io::IoSliceMut;
 
+use std::path::PathBuf;
+
 pub struct SeccompLoop {
     notify_fd: RawFd,
+    project_root: PathBuf,
 }
 
 impl SeccompLoop {
-    pub fn new(notify_fd: RawFd) -> Self {
-        Self { notify_fd }
+    pub fn new(notify_fd: RawFd, project_root: PathBuf) -> Self {
+        Self { notify_fd, project_root }
     }
 
     // Helper to read memory from the tracee
@@ -189,33 +192,24 @@ impl SeccompLoop {
     }
 
     fn handle_openat(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
-        // Implement atomic open using openat2 + inject_fd
-        
         let dirfd = req.data.args[0] as i32;
         let path_ptr = req.data.args[1];
-        let _flags = req.data.args[2];
-        let _mode = req.data.args[3];
         let tracee_pid = req.pid as pid_t;
         
-        // 1. Read path string from tracee with robust handling (page boundaries)
-        // We'll read in chunks until null terminator or max.
+        // 1. Read path string from tracee with page-aligned handling
         let mut path_buf = Vec::new();
-        let chunk_size = 256;
         let max_len = 4096;
+        let page_size = 4096;
         let mut current_addr = path_ptr as usize;
-        let mut loop_count = 0;
         
         loop {
-            if path_buf.len() >= max_len || loop_count > 20 {
+            if path_buf.len() >= max_len {
                 return Ok(self.resp_error(req, libc::ENAMETOOLONG));
             }
             
-            // Determine distance to next page boundary to avoid partial read failure if crossing unmapped page?
-            // Actually process_vm_readv handles crossing if pages are mapped. 
-            // But if we hit an unmapped page at the end of a string, it might fail.
-            // Better to read smaller chunks or use byte-by-byte if paranoid?
-            // "process_vm_readv" returns success even for partial reads if the first part is good? 
-            // No, it returns what it read.
+            // Calculate distance to next page boundary
+            let bytes_to_boundary = page_size - (current_addr % page_size);
+            let chunk_size = std::cmp::min(bytes_to_boundary, max_len - path_buf.len());
             
             let mut buf = vec![0u8; chunk_size];
             let local_iov = [IoSliceMut::new(&mut buf)];
@@ -224,10 +218,8 @@ impl SeccompLoop {
             let n = match process_vm_readv(nix::unistd::Pid::from_raw(tracee_pid), &local_iov, &remote_iov) {
                 Ok(n) => n,
                 Err(_) => {
-                    if path_buf.is_empty() {
-                         return Ok(self.resp_error(req, libc::EFAULT));
-                    }
-                    0 // Stop reading if we hit an error but have some data (maybe null terminator is just before?)
+                    if path_buf.is_empty() { return Ok(self.resp_error(req, libc::EFAULT)); }
+                    0 
                 }
             };
             
@@ -235,7 +227,6 @@ impl SeccompLoop {
                 return Ok(self.resp_error(req, libc::EFAULT));
             }
             
-            // Append and check for null
             let read_slice = &buf[..n];
             if let Some(pos) = read_slice.iter().position(|&b| b == 0) {
                 path_buf.extend_from_slice(&read_slice[..pos]);
@@ -244,12 +235,9 @@ impl SeccompLoop {
                 path_buf.extend_from_slice(read_slice);
                 current_addr += n;
                 if n < chunk_size {
-                    // Short read (EOF?), but no null terminator found yet?
-                    // String must be null terminated.
-                    return Ok(self.resp_error(req, libc::EFAULT)); // Or EINVAL
+                    return Ok(self.resp_error(req, libc::EFAULT));
                 }
             }
-            loop_count += 1;
         }
 
         let path_str = match std::str::from_utf8(&path_buf) {
@@ -257,37 +245,32 @@ impl SeccompLoop {
             Err(_) => return Ok(self.resp_error(req, libc::EINVAL)),
         };
 
-        // 2. Resolve Root FD based on dirfd
-        // If dirfd == AT_FDCWD (-100), we should use the sandbox root.
-        // If dirfd is a valid FD, we should ensure it resolves to something inside the sandbox.
-        // But since we control the injections, any FD the process has *should* be safe if we only injected safe FDs.
-        // However, standard descriptors (0, 1, 2) are not directories.
+        // 2. Resolve Root FD using pidfd_getfd for safety
+        use std::os::unix::io::FromRawFd;
         
-        // For strict sandbox, we enforce that all resolution happens relative to our designated locked root.
-        // We'll open "." of the supervisor as the effective root for now (assuming supervisor is chdir-ed or we configured it).
-        // Spec says: "Map it to the enforced sandbox project root."
-        
-        let root_fd = if dirfd == -100 { // AT_FDCWD
-             // Open the sandbox root. Ideally we cache this or pass it in SeccompLoop struct.
-             // For now, safely open "."
-             std::fs::File::open(".")
+        let root_handle = if dirfd == -100 { // AT_FDCWD
+             // Use our project root handle
+             std::fs::File::open(&self.project_root).map_err(|e| anyhow::anyhow!("Failed to open root {:?}: {}", self.project_root, e))?
         } else {
-             // If tracee supplies a dirfd, we must duplicate it to use it in openat2 in the supervisor?
-             // No, `openat2` needs a dirfd in the SUPERVISOR's namespace.
-             // The `dirfd` value provided in `req` is valid in the TRACEE's namespace.
-             // We cannot use it directly!
-             // We must fetch the FD from the tracee using `pidfd_getfd` (linux 5.6+) or `/proc/<pid>/fd/<fd>`.
+             // Use pidfd_open + pidfd_getfd
+             let pidfd = unsafe { libc::syscall(crate::seccomp_sys::SYS_pidfd_open, tracee_pid, 0) };
+             if pidfd < 0 {
+                 let err = std::io::Error::last_os_error();
+                 eprintln!("pidfd_open failed: {}", err);
+                 return Ok(self.resp_error(req, libc::ESRCH));
+             }
              
-             // Opening /proc/<pid>/fd/<fd> gives us a handle to the same file description.
-             let proc_path = format!("/proc/{}/fd/{}", tracee_pid, dirfd);
-             std::fs::File::open(proc_path)
-        }.map_err(|e| anyhow::anyhow!("Failed to resolve dirfd: {}", e));
-
-        let root_handle = match root_fd {
-            Ok(f) => f,
-            Err(_) => return Ok(self.resp_error(req, libc::EBADF)),
+             let dup_fd = unsafe { libc::syscall(crate::seccomp_sys::SYS_pidfd_getfd, pidfd, dirfd, 0) };
+             unsafe { libc::close(pidfd as i32) };
+             
+             if dup_fd < 0 {
+                  // EBADF probably
+                  return Ok(self.resp_error(req, libc::EBADF));
+             }
+             
+             unsafe { std::fs::File::from_raw_fd(dup_fd as i32) }
         };
-        
+
         // 3. Perform safe open
         let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str) {
             Ok(f) => f,
