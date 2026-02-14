@@ -1,6 +1,7 @@
 use serde_json::Value;
 use regex::Regex;
 
+#[derive(Clone)]
 pub struct JsonRpcProxy {
     unsafe_pattern: Regex,
 }

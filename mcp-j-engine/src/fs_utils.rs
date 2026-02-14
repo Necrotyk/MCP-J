@@ -8,6 +8,9 @@ use libc::{c_int, c_long};
 // If libc doesn't define them, we define them.
 const SYS_OPENAT2: c_long = 437; // x86_64
 const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_NO_XDEV: u64 = 0x01;
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -23,7 +26,7 @@ pub fn safe_open_beneath<P: AsRef<Path>>(root: &File, path: P) -> Result<File> {
     let how = open_how {
         flags: (libc::O_RDWR | libc::O_CLOEXEC) as u64, // Default flags, adjust as needed
         mode: 0,
-        resolve: RESOLVE_BENEATH,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
     };
 
     let ret = unsafe {

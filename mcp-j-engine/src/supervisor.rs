@@ -28,14 +28,14 @@ impl Supervisor {
         self
     }
 
-    pub fn start(mut self) -> Result<()> {
+    pub fn spawn(mut self) -> Result<JailedChild> {
         // Automatically allow reading the executable we are about to run
         self.landlock_ruleset = self.landlock_ruleset.allow_read(&self.command);
         for lib_path in ["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/bin", "/usr/bin"] {
             self.landlock_ruleset = self.landlock_ruleset.allow_read(lib_path);
         }
 
-        // Create socketpair for passing the notification FD from child to parent
+        // Create Seccomp Notify Socketpair
         let (parent_sock, child_sock) = nix::sys::socket::socketpair(
             nix::sys::socket::AddressFamily::Unix,
             nix::sys::socket::SockType::Stream,
@@ -43,52 +43,54 @@ impl Supervisor {
             nix::sys::socket::SockFlag::empty(),
         ).context("Failed to create socketpair")?;
 
+        // Create Stdin/Stdout pipes
+        let (stdin_read, stdin_write) = nix::unistd::pipe().context("Failed to create stdin pipe")?;
+        let (stdout_read, stdout_write) = nix::unistd::pipe().context("Failed to create stdout pipe")?;
+
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
                 // Parent process
-                unistd::close(child_sock).ok(); // Close child end
+                unistd::close(child_sock).ok(); 
+                unistd::close(stdin_read).ok();
+                unistd::close(stdout_write).ok();
+                
                 println!("Supervisor: Started child with PID {}", child);
 
                 // Receive the notification FD from child
                 let notify_fd = self.receive_notify_fd(parent_sock)?;
-                unistd::close(parent_sock).ok(); // Close socket after receiving
+                unistd::close(parent_sock).ok(); 
 
-                // Start Seccomp Loop
-                // We run it in a separate thread or async task if we want to waitpid concurrently?
-                // The loop is blocking in current implementation.
-                // But we ultimately need to handle the child exit too.
-                // For now, let's just run it in a thread so main thread can waitpid.
-                
+                // Start Seccomp Loop in background thread
                 let seccomp_loop = SeccompLoop::new(notify_fd);
                 std::thread::spawn(move || {
                     if let Err(e) = seccomp_loop.run() {
                         eprintln!("Seccomp loop error: {}", e);
                     }
                 });
+                
+                let stdin_file = unsafe { std::fs::File::from_raw_fd(stdin_write) };
+                let stdout_file = unsafe { std::fs::File::from_raw_fd(stdout_read) };
 
-                // Wait for child
-                loop {
-                    match waitpid(child, None) {
-                        Ok(WaitStatus::Exited(_, code)) => {
-                            println!("Child exited with code {}", code);
-                            break;
-                        }
-                        Ok(WaitStatus::Signaled(_, sig, _)) => {
-                            println!("Child signaled by {:?}", sig);
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(e) => {
-                            eprintln!("Waitpid error: {}", e);
-                            break;
-                        }
-                    }
-                }
+                Ok(JailedChild {
+                    pid: child,
+                    stdin: Some(stdin_file),
+                    stdout: Some(stdout_file),
+                })
             }
             Ok(ForkResult::Child) => {
                 // Child process
-                unistd::close(parent_sock).ok(); // Close parent end
+                unistd::close(parent_sock).ok();
                 
+                // Setup redirection
+                unistd::close(stdin_write).ok(); // Close parent end
+                unistd::close(stdout_read).ok();
+                
+                let _ = unistd::dup2(stdin_read, 0); // Stdin
+                let _ = unistd::dup2(stdout_write, 1); // Stdout
+                
+                unistd::close(stdin_read).ok();
+                unistd::close(stdout_write).ok();
+
                 if let Err(e) = self.setup_child(child_sock) {
                     eprintln!("Child setup failed: {}", e);
                     std::process::exit(1);
@@ -106,8 +108,18 @@ impl Supervisor {
                 anyhow::bail!("Fork failed: {}", e);
             }
         }
+    }
+}
 
-        Ok(())
+pub struct JailedChild {
+    pub pid: nix::unistd::Pid,
+    pub stdin: Option<std::fs::File>,
+    pub stdout: Option<std::fs::File>,
+}
+
+impl JailedChild {
+    pub fn wait(&mut self) -> Result<WaitStatus> {
+        waitpid(self.pid, None).map_err(|e| anyhow::anyhow!("waitpid failed: {}", e))
     }
 
     fn receive_notify_fd(&self, sock: RawFd) -> Result<RawFd> {
@@ -162,12 +174,40 @@ impl Supervisor {
         // Now unshare the rest as the new root user in the new user namespace
         unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWPID)?;
         
-        // We need to mount proc for the new PID namespace to work properly if we fork again?
-        // But we are just execing.
-        // If we want ps to work, we need to mount proc.
-        // But for minimal jail, skipping proc mount is safer (no information leak).
-        // However, many tools expect /proc.
-        // Let's implement a minimal tmpfs mount on /tmp if possible, but keep it simple.
+        // Mount setup
+        // 1. Mark propagation as private
+        // MS_REC | MS_PRIVATE
+        use nix::mount::{mount, MsFlags};
+        
+        // We need to ensure we have the "mount" feature in nix.
+        // Assuming it is available or I will add it.
+        
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+            None::<&str>,
+        ).context("Failed to make / private")?;
+
+        // 2. Mount tmpfs on /tmp
+        // We need to ensure /tmp exists? It likely does.
+        mount(
+            Some("tmpfs"),
+            "/tmp",
+            Some("tmpfs"),
+            MsFlags::empty(),
+            Some("mode=1777,size=64m"),
+        ).context("Failed to mount tmpfs on /tmp")?;
+        
+        // 3. Proc? 
+        // If we want to hide processes, we DO NOT mount proc.
+        // If the tool needs it, we mount it.
+        // Spec says "minimal jail", usually implies no /proc if possible.
+        // Or mount a fresh proc instance:
+        // mount(Some("proc"), "/proc", Some("proc"), MsFlags::empty(), None)?;
+        // Let's explicitly NOT mount proc for now to prevent info leaks.
+
 
 
         

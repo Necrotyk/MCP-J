@@ -1,5 +1,5 @@
 use landlock::{
-    Access, AccessFs, Ruleset, RulesetAttr, RulesetError, ABI,
+    AccessFs, Ruleset, RulesetError, ABI,
     PathFd,
 };
 use std::collections::HashMap;

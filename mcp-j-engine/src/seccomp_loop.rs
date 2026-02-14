@@ -197,54 +197,108 @@ impl SeccompLoop {
         let _mode = req.data.args[3];
         let tracee_pid = req.pid as pid_t;
         
-        // Read path string from tracee
-        // We need to loop or guess length, assuming PATH_MAX (4096)
-        let mut buf = vec![0u8; 4096];
-        let local_iov = [IoSliceMut::new(&mut buf)];
-        let remote_iov = [RemoteIoVec { base: path_ptr as usize, len: 4096 }];
+        // 1. Read path string from tracee with robust handling (page boundaries)
+        // We'll read in chunks until null terminator or max.
+        let mut path_buf = Vec::new();
+        let chunk_size = 256;
+        let max_len = 4096;
+        let mut current_addr = path_ptr as usize;
+        let mut loop_count = 0;
         
-        // Use process_vm_readv_string-like logic? 
-        // Just read a chunk and look for null terminator.
-        let n = process_vm_readv(nix::unistd::Pid::from_raw(tracee_pid), &local_iov, &remote_iov).unwrap_or(0);
-        if n == 0 {
-             return Ok(self.resp_error(req, libc::EFAULT));
+        loop {
+            if path_buf.len() >= max_len || loop_count > 20 {
+                return Ok(self.resp_error(req, libc::ENAMETOOLONG));
+            }
+            
+            // Determine distance to next page boundary to avoid partial read failure if crossing unmapped page?
+            // Actually process_vm_readv handles crossing if pages are mapped. 
+            // But if we hit an unmapped page at the end of a string, it might fail.
+            // Better to read smaller chunks or use byte-by-byte if paranoid?
+            // "process_vm_readv" returns success even for partial reads if the first part is good? 
+            // No, it returns what it read.
+            
+            let mut buf = vec![0u8; chunk_size];
+            let local_iov = [IoSliceMut::new(&mut buf)];
+            let remote_iov = [RemoteIoVec { base: current_addr, len: chunk_size }];
+            
+            let n = match process_vm_readv(nix::unistd::Pid::from_raw(tracee_pid), &local_iov, &remote_iov) {
+                Ok(n) => n,
+                Err(_) => {
+                    if path_buf.is_empty() {
+                         return Ok(self.resp_error(req, libc::EFAULT));
+                    }
+                    0 // Stop reading if we hit an error but have some data (maybe null terminator is just before?)
+                }
+            };
+            
+            if n == 0 && path_buf.is_empty() {
+                return Ok(self.resp_error(req, libc::EFAULT));
+            }
+            
+            // Append and check for null
+            let read_slice = &buf[..n];
+            if let Some(pos) = read_slice.iter().position(|&b| b == 0) {
+                path_buf.extend_from_slice(&read_slice[..pos]);
+                break;
+            } else {
+                path_buf.extend_from_slice(read_slice);
+                current_addr += n;
+                if n < chunk_size {
+                    // Short read (EOF?), but no null terminator found yet?
+                    // String must be null terminated.
+                    return Ok(self.resp_error(req, libc::EFAULT)); // Or EINVAL
+                }
+            }
+            loop_count += 1;
         }
+
+        let path_str = match std::str::from_utf8(&path_buf) {
+            Ok(s) => s,
+            Err(_) => return Ok(self.resp_error(req, libc::EINVAL)),
+        };
+
+        // 2. Resolve Root FD based on dirfd
+        // If dirfd == AT_FDCWD (-100), we should use the sandbox root.
+        // If dirfd is a valid FD, we should ensure it resolves to something inside the sandbox.
+        // But since we control the injections, any FD the process has *should* be safe if we only injected safe FDs.
+        // However, standard descriptors (0, 1, 2) are not directories.
         
-        // Find null byte
-        let path_str = match buf[..n].iter().position(|&c| c == 0) {
-            Some(i) => std::str::from_utf8(&buf[..i]).unwrap_or(""),
-            None => return Ok(self.resp_error(req, libc::ENAMETOOLONG)),
+        // For strict sandbox, we enforce that all resolution happens relative to our designated locked root.
+        // We'll open "." of the supervisor as the effective root for now (assuming supervisor is chdir-ed or we configured it).
+        // Spec says: "Map it to the enforced sandbox project root."
+        
+        let root_fd = if dirfd == -100 { // AT_FDCWD
+             // Open the sandbox root. Ideally we cache this or pass it in SeccompLoop struct.
+             // For now, safely open "."
+             std::fs::File::open(".")
+        } else {
+             // If tracee supplies a dirfd, we must duplicate it to use it in openat2 in the supervisor?
+             // No, `openat2` needs a dirfd in the SUPERVISOR's namespace.
+             // The `dirfd` value provided in `req` is valid in the TRACEE's namespace.
+             // We cannot use it directly!
+             // We must fetch the FD from the tracee using `pidfd_getfd` (linux 5.6+) or `/proc/<pid>/fd/<fd>`.
+             
+             // Opening /proc/<pid>/fd/<fd> gives us a handle to the same file description.
+             let proc_path = format!("/proc/{}/fd/{}", tracee_pid, dirfd);
+             std::fs::File::open(proc_path)
+        }.map_err(|e| anyhow::anyhow!("Failed to resolve dirfd: {}", e));
+
+        let root_handle = match root_fd {
+            Ok(f) => f,
+            Err(_) => return Ok(self.resp_error(req, libc::EBADF)),
         };
         
-        // Determine root for resolution.
-        // For simplicity, we assume we are resolving relative to the CWD of the supervisor or a designated root?
-        // Wait, files should be restricted to the project root allowed by Landlock.
-        // The supervisor should have open handles to allowed roots.
-        // For now, let's just demonstrate the mechanism using the Current Working Directory of the Supervisor.
-        // Ideally, `dirfd` from tracee should be mapped to supervisor's FD if it was previously injected.
-        // But `AT_FDCWD` (-100) means CWD.
-        
-        let root_dot = std::fs::File::open(".").map_err(|_| anyhow::anyhow!("Failed to open ."))?;
-        
-        // Perform safe open
-        let file = match crate::fs_utils::safe_open_beneath(&root_dot, path_str) {
+        // 3. Perform safe open
+        let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str) {
             Ok(f) => f,
             Err(e) => {
-                // Determine errno (EACCES, ENOENT, ...)
-                // For now, EACCES on failure
                 eprintln!("Blocked open access to {}: {}", path_str, e);
                 return Ok(self.resp_error(req, libc::EACCES));
             }
         };
         
-        // Inject FD
+        // 4. Inject FD
         let injected_fd = self.inject_fd(req, file.as_raw_fd())?;
-        
-        // Respond with success and the new FD as return value.
-        // To return a value, we set `val` and use `SECCOMP_USER_NOTIF_FLAG_CONTINUE`? NO.
-        // If we handled it, we DO NOT set FLAG_CONTINUE.
-        // We set `val` to the return value (the fd) and `error` to 0.
-        // And flags = 0.
         
         Ok(seccomp_notif_resp {
             id: req.id,
