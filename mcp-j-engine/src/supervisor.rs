@@ -247,13 +247,29 @@ impl Supervisor {
             std::fs::create_dir(&workspace_path).context("Failed to create workspace in jail")?;
         }
         
+        // --- PHASE 37: Ephemeral OverlayFS Workspaces ---
+        // Create OverlayFS directories for ephemeral state
+        let upper_dir = std::path::Path::new("/tmp/overlay_upper");
+        let work_dir = std::path::Path::new("/tmp/overlay_work");
+        
+        if !upper_dir.exists() { std::fs::create_dir(upper_dir).context("Failed to create overlay upper")?; }
+        if !work_dir.exists() { std::fs::create_dir(work_dir).context("Failed to create overlay work")?; }
+        
+        // Mount OverlayFS to /workspace
+        let overlay_options = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            self.project_root.display(),
+            upper_dir.display(),
+            work_dir.display()
+        );
+        
         mount(
-            Some(&self.project_root),
+            Some("overlay"),
             &workspace_path,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        ).context("Failed to bind mount project root")?;
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(overlay_options.as_str()),
+        ).context("Failed to mount workspace overlayfs")?;
         
         // Use manifest mounts
         for mount_path_str in &self.manifest.readonly_mounts {

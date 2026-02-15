@@ -32,6 +32,11 @@ impl SeccompLoop {
         // Always allow localhost
         allowed_ips.insert(0x7F000001); // 127.0.0.1
         
+        // Phase 38: DNS Resolution Entitlement (Cloudflare/Google)
+        // Explicitly allow UDP/TCP traffic to 1.1.1.1 and 8.8.8.8 for resolution
+        allowed_ips.insert(u32::from(std::net::Ipv4Addr::new(1, 1, 1, 1)));
+        allowed_ips.insert(u32::from(std::net::Ipv4Addr::new(8, 8, 8, 8)));
+        
         for ip_str in &manifest.allowed_egress_ips {
             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                  allowed_ips.insert(u32::from(ip));
@@ -118,7 +123,7 @@ impl SeccompLoop {
             let mut req: seccomp_notif = unsafe { std::mem::zeroed() };
             
             // ioctl call
-            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &mut req) };
+            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_RECV as libc::c_int, &mut req) };
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -134,7 +139,7 @@ impl SeccompLoop {
             let resp = self.handle_request(&req)?;
 
             // Send response
-            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) };
+            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND as libc::c_int, &resp) };
             if ret < 0 {
                  let err = std::io::Error::last_os_error();
                  // If process died between RECV and SEND, acceptable.
@@ -399,7 +404,7 @@ impl SeccompLoop {
             newfd_flags: 0,
         };
         
-        let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &mut addfd) };
+        let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_int, &mut addfd) };
         if ret < 0 {
              let err = std::io::Error::last_os_error();
              return Err(anyhow::anyhow!("ioctl ADDFD failed: {}", err));

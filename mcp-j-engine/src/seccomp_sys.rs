@@ -37,15 +37,15 @@ const _IOC_READ: u32 = 2;
 const _IOC_WRITE: u32 = 1;
 const _IOC_NONE: u32 = 0;
 
-const fn _ioc(dir: u32, type_: u8, nr: u32, size: usize) -> u64 {
-    ((dir as u64) << _IOC_DIRSHIFT) |
-    ((type_ as u64) << _IOC_TYPESHIFT) |
-    ((nr as u64) << _IOC_NRSHIFT) |
-    ((size as u64) << _IOC_SIZESHIFT)
+const fn _ioc(dir: u32, type_: u8, nr: u32, size: usize) -> u32 {
+    (dir << _IOC_DIRSHIFT) |
+    ((type_ as u32) << _IOC_TYPESHIFT) |
+    (nr << _IOC_NRSHIFT) |
+    ((size as u32) << _IOC_SIZESHIFT)
 }
 
 const fn _iowr(type_: u8, nr: u32, size: usize) -> u64 {
-    _ioc(_IOC_READ | _IOC_WRITE, type_, nr, size)
+    _ioc(_IOC_READ | _IOC_WRITE, type_, nr, size) as u64
 }
 
 #[repr(C)]

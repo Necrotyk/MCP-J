@@ -1,42 +1,41 @@
 use std::process::Command;
 use std::net::TcpStream;
-use std::fs::File;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::os::unix::io::AsRawFd;
 
 fn main() {
-    println!("Starting Malicious Agent Simulation...");
+    println!("{{\"jsonrpc\": \"2.0\", \"method\": \"mcp/status\", \"params\": {{\"status\": \"Agent initialized. Commencing boundary stress tests.\"}}}}");
 
-    // 1. execve("/bin/sh") bypass attempt
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg("echo pwned")
-        .output();
-    match output {
-        Ok(o) => println!("Execve result: {:?}", o),
-        Err(e) => eprintln!("Execve blocked (GOOD): {}", e),
+    // Vector 1: LotL Execve Bypass
+    let out = Command::new("/bin/bash").arg("-c").arg("cat /etc/shadow").output();
+    if out.is_err() {
+        eprintln!("TRAP: execve(/bin/bash) blocked by Seccomp/Landlock.");
     }
 
-    // 2. connect() to external IP attempt
-    match TcpStream::connect("8.8.8.8:53") {
-        Ok(_) => println!("Connect success (BAD)"),
-        Err(e) => eprintln!("Connect blocked (GOOD): {}", e),
+    // Vector 2: Data Exfiltration via Unauthorized Egress
+    let stream = TcpStream::connect("1.1.1.1:53");
+    if stream.is_err() {
+        eprintln!("TRAP: connect(1.1.1.1:53) blocked by Seccomp Egress Policy.");
     }
 
-    // 3. openat traversal attempt
-    match File::open("/workspace/../../etc/passwd") {
-        Ok(_) => println!("Traversal open success (BAD)"),
-        Err(e) => eprintln!("Traversal blocked (GOOD): {}", e),
+    // Vector 3: VFS Traversal (Lexical & Magic Links)
+    let file = File::open("/workspace/../../etc/passwd");
+    if file.is_err() {
+        eprintln!("TRAP: openat(/workspace/../../etc/passwd) blocked by Lexical Scanner / RESOLVE_BENEATH.");
     }
-    
-    // 4. OOM Attempt
-    println!("Starting leak...");
-    let mut leak = Vec::new();
-    loop {
-        leak.extend_from_slice(&[0u8; 1024 * 1024]); // 1MB chunks
-        // Limit to prevent host freeze if limits fail, but should be killed by cgroup
-        if leak.len() > 600 * 1024 * 1024 { 
-            break; 
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Vector 4: FD Privilege Escalation Attempt
+    // Attempting to open a read-only manifest mount with O_RDWR to test flag masking
+    let rw_system_file = OpenOptions::new().read(true).write(true).open("/lib/x86_64-linux-gnu/libc.so.6");
+    if rw_system_file.is_err() {
+        eprintln!("TRAP: openat(O_RDWR) on /lib blocked by Landlock / Flag Masking.");
+    }
+
+    // Vector 5: Ambient Host Environment Leakage
+    if std::env::var("AWS_ACCESS_KEY_ID").is_ok() {
+        eprintln!("FATAL: Host environment leaked into tracee.");
+        std::process::exit(1);
+    } else {
+        eprintln!("SECURE: Host ambient environment purged successfully.");
     }
 }
