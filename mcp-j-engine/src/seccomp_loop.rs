@@ -162,6 +162,8 @@ impl SeccompLoop {
             libc::SYS_connect => self.handle_connect(req),
             libc::SYS_execve => self.handle_execve(req),
             libc::SYS_bind => self.handle_bind(req),
+            libc::SYS_sendto => self.handle_sendto(req),
+            libc::SYS_sendmsg => self.handle_sendmsg(req),
             libc::SYS_openat => self.handle_openat(req),
             libc::SYS_open => {
                 // Legacy open: int open(const char *pathname, int flags, mode_t mode);
@@ -324,6 +326,116 @@ impl SeccompLoop {
 
     fn handle_bind(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
         Ok(self.resp_continue(req))
+    }
+
+    fn handle_sendto(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+        // sendto(sockfd, buf, len, flags, dest_addr, addrlen)
+        let addr_ptr = req.data.args[4];
+        let addr_len = req.data.args[5];
+        
+        if addr_ptr == 0 {
+             // If addr is NULL, it's a connected socket. Allow as connect() was already checked.
+             return Ok(self.resp_continue(req));
+        }
+        
+        // Re-use handle_connect logic effectively by mocking a connect request or factoring out validation
+        // We will call validate_address directly.
+        // But handle_connect takes &req. We need a helper that takes (pid, addr_ptr, addr_len).
+        
+        self.validate_address(req.pid as i32, addr_ptr, addr_len as usize, req)
+    }
+
+    fn handle_sendmsg(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+        // sendmsg(sockfd, msg, flags)
+        // msg is struct msghdr { void *msg_name; socklen_t msg_namelen; ... }
+        // We need to read msghdr from tracee memory to check msg_name (dest address).
+        
+        let msg_ptr = req.data.args[1];
+        let tracee_pid = req.pid as i32;
+        
+        // struct msghdr (glibc x64):
+        // void *msg_name; (0)
+        // socklen_t msg_namelen; (8)
+        // struct iovec *msg_iov; (16)
+        // size_t msg_iovlen; (24)
+        // void *msg_control; (32)
+        // size_t msg_controllen; (40)
+        // int msg_flags; (48)
+        
+        let header_bytes = match self.read_tracee_memory(tracee_pid, msg_ptr, 16) { // Read first 16 bytes for name and namelen
+             Ok(b) => b,
+             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
+        };
+        
+        if header_bytes.len() < 16 {
+             return Ok(self.resp_error(req, libc::EFAULT));
+        }
+        
+        let msg_name_ptr = u64::from_ne_bytes(header_bytes[0..8].try_into().unwrap());
+        let msg_namelen = u32::from_ne_bytes(header_bytes[8..12].try_into().unwrap()); // socklen_t is u32 usually
+        
+        if msg_name_ptr == 0 {
+             // Connected socket
+             return Ok(self.resp_continue(req));
+        }
+        
+        self.validate_address(tracee_pid, msg_name_ptr, msg_namelen as usize, req)
+    }
+    
+    // Refactored validation logic
+    fn validate_address(&self, pid: i32, addr_ptr: u64, addr_len: usize, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+        // Strict length checking for known families
+        if addr_len < std::mem::size_of::<libc::sa_family_t>() {
+             return Ok(self.resp_error(req, libc::EINVAL));
+        }
+        
+        if addr_len > 128 { 
+             return Ok(self.resp_error(req, libc::EINVAL));
+        }
+
+        let buf = match self.read_tracee_memory(pid, addr_ptr, addr_len) {
+            Ok(b) => b,
+            Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
+        };
+
+        if buf.len() < 2 {
+             return Ok(self.resp_error(req, libc::EINVAL));
+        }
+        
+        let sa_family = u16::from_ne_bytes([buf[0], buf[1]]);
+        
+        match sa_family as i32 {
+            libc::AF_UNIX => Ok(self.resp_continue(req)),
+            libc::AF_INET => {
+                 if addr_len < std::mem::size_of::<libc::sockaddr_in>() {
+                      return Ok(self.resp_error(req, libc::EINVAL));
+                 }
+                 
+                 let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                 unsafe {
+                     std::ptr::copy_nonoverlapping(
+                         buf.as_ptr(), 
+                         &mut sin as *mut _ as *mut u8, 
+                         std::mem::size_of::<libc::sockaddr_in>()
+                     );
+                 }
+                 
+                 let ip_host_order = u32::from_be(sin.sin_addr.s_addr);
+                 
+                 if self.allowed_ips.contains(&ip_host_order) {
+                      Ok(self.resp_continue(req))
+                 } else {
+                      let ip_addr = std::net::Ipv4Addr::from(ip_host_order);
+                      tracing::warn!(pid = pid, dst_ip = %ip_addr, "Blocked outbound UDP/TCP (sendto/msg)");
+                      Ok(self.resp_error(req, libc::EACCES))
+                 }
+            },
+            libc::AF_INET6 => {
+                 tracing::warn!(pid = pid, family = "IPv6", "Blocked outbound connection");
+                 Ok(self.resp_error(req, libc::EACCES))
+            },
+            _ => Ok(self.resp_error(req, libc::EAFNOSUPPORT))
+        }
     }
 
     fn handle_openat(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {

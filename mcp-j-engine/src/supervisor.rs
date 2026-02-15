@@ -247,13 +247,14 @@ impl Supervisor {
             std::fs::create_dir(&workspace_path).context("Failed to create workspace in jail")?;
         }
         
-        // --- PHASE 37: Ephemeral OverlayFS Workspaces ---
-        // Create OverlayFS directories for ephemeral state
-        let upper_dir = std::path::Path::new("/tmp/overlay_upper");
-        let work_dir = std::path::Path::new("/tmp/overlay_work");
+        // --- PHASE 41: Ephemeral Concurrency Isolation ---
+        // Derive staging paths utilizing the tracee's PID
+        let pid = std::process::id();
+        let upper_dir = std::path::PathBuf::from(format!("/tmp/mcp_upper_{}", pid));
+        let work_dir = std::path::PathBuf::from(format!("/tmp/mcp_work_{}", pid));
         
-        if !upper_dir.exists() { std::fs::create_dir(upper_dir).context("Failed to create overlay upper")?; }
-        if !work_dir.exists() { std::fs::create_dir(work_dir).context("Failed to create overlay work")?; }
+        if !upper_dir.exists() { std::fs::create_dir(&upper_dir).context("Failed to create overlay upper")?; }
+        if !work_dir.exists() { std::fs::create_dir(&work_dir).context("Failed to create overlay work")?; }
         
         // Mount OverlayFS to /workspace
         let overlay_options = format!(
@@ -412,6 +413,11 @@ impl Supervisor {
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("connect")?)?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("execve")?)?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("bind")?)?;
+        
+        // Phase 42: Connectionless Egress Sealing (UDP)
+        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("sendto")?)?;
+        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("sendmsg")?)?; 
+        
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("openat")?)?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("open")?)?; // Legacy open, maps to openat often but good to catch.
         

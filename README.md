@@ -18,8 +18,9 @@ MCP-J is a hardened, secure runtime environment for executing untrusted [Model C
 
 ### 🌐 Network & Resource Control
 - **Default-Deny Network Policy**: Outbound network access is strictly blocked by default.
-    - **Allowlist**: Only `127.0.0.1` (localhost) is permitted for proxy communication.
+    - **Allowlist**: Only `127.0.0.1` (localhost) and core DNS resolvers (`1.1.1.1`, `8.8.8.8`) are permitted for proxy/resolution communication.
     - **Blocklist**: All other IPv4/IPv6 traffic is denied, explicitly blocking cloud metadata services (e.g., AWS `169.254.169.254`).
+    - **UDP/TCP Equality**: The Seccomp filter intercepts both connected (`connect`) and connectionless (`sendto`, `sendmsg`) socket operations, preventing UDP data exfiltration and DNS tunneling bypasses.
 - **Resource Constraints**: Cgroups v2 integration limits the agent to **512MB** of memory to prevent Denial-of-Service (DoS) via resource exhaustion.
 
 ### ⚡ Secure IPC Proxy

@@ -46,6 +46,50 @@ export function activate(context: vscode.ExtensionContext) {
 
     outputChannel.appendLine(`Target Binary: ${command}`);
     outputChannel.appendLine(`Target Manifest: ${manifestPath}`);
+
+    // Phase 43: Client IPC Telemetry Bridge
+    // Manually spawn and bridge to SDK transport
+    const cp = require('child_process');
+    const child = cp.spawn(command, [
+        '--manifest', manifestPath,
+        '/usr/bin/python3' // Default entrypoint
+    ], {
+        env: { ...process.env, RUST_LOG: "info" }
+    });
+
+    child.stderr.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n');
+        for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+                const log = JSON.parse(line);
+                // Pretty print structured log to output channel
+                const level = log.level || "INFO";
+                const source = log.fields?.source || log.target || "unknown";
+                const msg = log.fields?.message || log.message || "";
+
+                outputChannel.appendLine(`[${level}] [${source}] ${msg}`);
+
+                if (log.fields?.dst_ip) {
+                    outputChannel.appendLine(`    > Forbidden Egress: ${log.fields.dst_ip}`);
+                }
+            } catch (e) {
+                // Fallback for non-JSON stderr
+                outputChannel.appendLine(`[RAW] ${line}`);
+            }
+        }
+    });
+
+    child.on('error', (err: any) => {
+        outputChannel.appendLine(`[FATAL] Process Error: ${err.message}`);
+    });
+
+    child.on('close', (code: number) => {
+        outputChannel.appendLine(`[EXIT] Process exited with code ${code}`);
+    });
+
+    // TODO: Connect child.stdin/stdout to MCP Client Transport
+    // const transport = new StdioClientTransport(child.stdin, child.stdout);
 }
 
 export function deactivate() { }
