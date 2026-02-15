@@ -16,10 +16,11 @@ struct Cli {
 }
 
 use mcp_j_proxy::JsonRpcProxy;
-use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_util::codec::{FramedRead, LinesCodec};
-use tokio::io::AsyncWriteExt;
-use futures::StreamExt; // For .next()
+use futures::StreamExt;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -71,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     let child_stdin = child.stdin.take().expect("Child stdin missing");
     let child_stdout = child.stdout.take().expect("Child stdout missing");
     
-    let mut async_child_stdin = tokio::fs::File::from_std(child_stdin);
+    let async_child_stdin = tokio::fs::File::from_std(child_stdin);
     let async_child_stdout = tokio::fs::File::from_std(child_stdout);
     
     let host_stdin = tokio::io::stdin();
@@ -82,40 +83,60 @@ async fn main() -> anyhow::Result<()> {
 
     // Inbound Task: Host Stdin -> Proxy -> Child Stdin
     let proxy_in = proxy.clone();
+    // Prepare reader for host_stdin
+    let mut reader = tokio::io::BufReader::new(host_stdin);
+    // Prepare writer for child_stdin, wrapped in a mutex for shared access
+    let stdin_writer = Arc::new(Mutex::new(async_child_stdin));
+    let stdin_writer_clone = stdin_writer.clone();
     let inbound_task = tokio::spawn(async move {
-        let codec = LinesCodec::new_with_max_length(max_length);
-        let mut framed_stdin = FramedRead::new(host_stdin, codec);
+        // Read loop with LSP header stripping (Phase 13)
+        loop {
+            // We use read_line to robustly handle potentially mixed content or just pure JSONL
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    // Check for Content-Length or other headers
+                    if line.starts_with("Content-Length:") || line == "\r\n" {
+                         continue; 
+                    }
+                    
+                    if line.trim().is_empty() {
+                        continue;
+                    }
 
-        while let Some(line_result) = framed_stdin.next().await {
-            match line_result {
-                Ok(line) => {
+                    tracing::info!(len = line.len(), "Received line");
+
+                    // Parse JSON-RPC
                     match proxy_in.validate_and_parse(&line) {
-                        Ok(v) => {
-                             // Serialize back to raw line
-                             // Wait, validation returns Value, we could re-serialize
-                             // or just forward the original string if clean.
-                             // `validate_and_parse` parses to Value.
-                             // To be safe and canonical, let's re-serialize.
-                             let mut raw = serde_json::to_string(&v)?;
-                             raw.push('\n');
-                             async_child_stdin.write_all(raw.as_bytes()).await?;
-                             async_child_stdin.flush().await?;
+                        Ok(valid_req) => {
+                             // Forward to child
+                             let mut child_stdin = stdin_writer_clone.lock().await;
+                             // We re-serialize to ensure clean output format
+                             let mut serialized = serde_json::to_string(&valid_req).unwrap();
+                             serialized.push('\n');
+                             if let Err(e) = child_stdin.write_all(serialized.as_bytes()).await {
+                                 tracing::error!(error = %e, "Failed to write to child stdin");
+                                 break;
+                             }
+                             if let Err(e) = child_stdin.flush().await {
+                                 tracing::error!(error = %e, "Failed to flush child stdin");
+                                 break;
+                             }
                         }
-                        Err(err_obj) => {
-                             tracing::warn!(error = ?err_obj, "Proxy Blocked Inbound");
-                             
+                        Err(rpc_err) => {
+                             // Reply with error to stdout
+                             let mut serialized = serde_json::to_string(&rpc_err).unwrap();
+                             serialized.push('\n');
                              let mut stdout = tokio::io::stdout();
-                             let mut raw = serde_json::to_string(&err_obj).unwrap_or_default();
-                             raw.push('\n');
-                             // We ignore errors here
-                             let _ = stdout.write_all(raw.as_bytes()).await;
+                             let _ = stdout.write_all(serialized.as_bytes()).await;
                              let _ = stdout.flush().await;
                         }
                     }
                 }
                 Err(e) => {
-                     tracing::error!(error = %e, "Framing Error (Inbound)");
-                     break;
+                    tracing::error!(error = %e, "Stdin read error");
+                    break;
                 }
             }
         }

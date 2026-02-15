@@ -395,7 +395,8 @@ impl SeccompLoop {
 
         // 3. Perform safe open
         let flags = req.data.args[2]; // openat(dirfd, path, flags, mode)
-        let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str, flags) {
+        let mode = req.data.args[3];
+        let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str, flags, mode) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(pid = tracee_pid, path = %path_str, error = %e, "Blocked openat access");
@@ -438,6 +439,7 @@ impl SeccompLoop {
     fn handle_open_legacy(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
          let ptr = req.data.args[0];
          let flags = req.data.args[1];
+         let mode = req.data.args[2];
          
          let tracee_pid = req.pid as pid_t;
          let path_str = match self.read_string_tracee(tracee_pid, ptr) {
@@ -456,7 +458,7 @@ impl SeccompLoop {
              }
          };
          
-         match crate::fs_utils::safe_open_beneath(&root_handle, &path_str, flags) {
+         match crate::fs_utils::safe_open_beneath(&root_handle, &path_str, flags, mode) {
             Ok(file) => {
                 let injected = self.inject_fd(req, file.as_raw_fd())?;
                 Ok(seccomp_notif_resp {

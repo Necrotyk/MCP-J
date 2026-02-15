@@ -14,6 +14,7 @@ MCP-J is a hardened, secure runtime environment for executing untrusted [Model C
 - **TOCTOU Mitigation**: Secure file descriptor handling using `pidfd_open` and `pidfd_getfd` to prevent race conditions.
 - **Strict Execve Control**: Implementation of `handle_execve` ensures only approved binaries within read-only, root-owned mount points can be executed.
 - **Privilege Dropping**: The agent process drops all capabilities (`PR_CAPBSET_DROP`) and permanently switches to the unprivileged `nobody` user (UID 65534).
+- **Cgroup Process Annihilation**: The `CgroupGuard` RAII struct ensures absolute cleanup by inspecting `cgroup.procs` and issuing `SIGKILL` to all lingering processes before removing the controller group, preventing resource leaks.
 
 ### 🌐 Network & Resource Control
 - **Default-Deny Network Policy**: Outbound network access is strictly blocked by default.

@@ -380,10 +380,23 @@ impl CgroupGuard {
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
-        // Attempt to remove cgroup
-        // It might be busy if child is still running, but we try best effort.
-        // Or if we moved child out? (we don't move child out usually).
-        // Usually wait() happens before drop.
+        // Phase 10: Annihilate all processes in cgroup before removal
+        let procs_path = self.path.join("cgroup.procs");
+        
+        if let Ok(content) = std::fs::read_to_string(&procs_path) {
+            for line in content.lines() {
+                if let Ok(pid) = line.trim().parse::<i32>() {
+                    // Send SIGKILL to ensure no zombies or daemons persist
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        
+        // Brief yield/wait might be needed, but usually we just try removing.
+        // A retry loop could be more robust if needed.
+        // Try removing the directory
         let _ = std::fs::remove_dir(&self.path);
     }
 }

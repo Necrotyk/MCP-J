@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
-use anyhow::Result;
+use anyhow::{Result, Context};
 use libc::c_long;
 
 // openat2 constants - normally in linux/openat2.h or fcntl.h
@@ -18,20 +18,27 @@ struct open_how {
     resolve: u64,
 }
 
-pub fn safe_open_beneath<P: AsRef<Path>>(root: &File, path: P, flags: u64) -> Result<File> {
-    let path_cstr = std::ffi::CString::new(path.as_ref().to_str().unwrap_or("")).unwrap();
+pub fn safe_open_beneath<P: AsRef<Path>>(root: &File, path: P, flags: u64, mode: u64) -> Result<File> {
+    use std::os::unix::ffi::OsStrExt;
     
-    // Mask allowed flags. We allow read/write, create, etc.
-    // Important: O_CLOEXEC is mandatory for injected FDs usually, though injection handles it separately?
-    // We enforce O_CLOEXEC here for good measure.
+    // Byte-safe CString conversion (Phase 12)
+    let path_bytes = path.as_ref().as_os_str().as_bytes();
+    let path_cstr = std::ffi::CString::new(path_bytes).context("Failed to create CString from path bytes")?;
+    
+    // Mask allowed flags.
     let allowed_mask = (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_APPEND) as u64;
     let safe_flags = (flags & allowed_mask) | (libc::O_CLOEXEC as u64);
 
+    // Apply strict mode masking if O_CREAT is involved (Phase 11)
+    let safe_mode = if (safe_flags & (libc::O_CREAT as u64)) != 0 {
+         mode & 0o777 // Mask out SUID/SGID/Sticky bits for safety
+    } else {
+         0
+    };
+
     let how = open_how {
         flags: safe_flags,
-        mode: 0o666, // Default mode if O_CREAT is used. User mask applies? Openat2 might need explicit mode.
-        // Actually, seccomp notify usually passes the 'mode' argument from openat syscall too.
-        // For now, simpler implementation with default conservative mode (rw-rw-rw-).
+        mode: safe_mode, 
         resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
     };
 
@@ -47,7 +54,6 @@ pub fn safe_open_beneath<P: AsRef<Path>>(root: &File, path: P, flags: u64) -> Re
 
     if ret < 0 {
         let err = std::io::Error::last_os_error();
-        // ELOOP or EXDEV usually indicates escape attempt
         anyhow::bail!("openat2 failed: {}", err);
     }
 
