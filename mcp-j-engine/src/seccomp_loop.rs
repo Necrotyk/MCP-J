@@ -296,6 +296,11 @@ impl SeccompLoop {
         }) || path_bytes == self.allowed_command.as_os_str().as_bytes();
 
         if is_allowed {
+             // Phase 21: TOCTOU Acknowledgment
+             // Note: There is a theoretical Time-Of-Check-Time-Of-Use race here where the tracee
+             // could swap the path memory after we read it but before the kernel executes it.
+             // We rely on Landlock LSM as the authoritative security boundary to prevent unauthorized execution.
+             tracing::debug!(pid = tracee_pid, "Authorizing execve (Landlock will enforce final boundary)");
              Ok(self.resp_continue(req))
         } else {
              // Reconstruct lossy string for logging
@@ -319,6 +324,19 @@ impl SeccompLoop {
              Ok(p) => p,
              Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
         };
+
+        // Phase 20: Absolute Path Resolution Bypass (Library Loading)
+        if path_bytes.starts_with(b"/") {
+             use std::os::unix::ffi::OsStrExt;
+             let is_allowed_system = self.manifest.readonly_mounts.iter().any(|prefix| {
+                  let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();
+                  path_bytes.starts_with(prefix_bytes)
+             });
+             
+             if is_allowed_system {
+                  return Ok(self.resp_continue(req));
+             }
+        }
 
         // 2. Resolve Root FD
         use std::os::unix::io::FromRawFd;
@@ -399,6 +417,19 @@ impl SeccompLoop {
             }
          };
          
+        // Phase 20: Absolute Path Resolution Bypass (Library Loading)
+        if path_bytes.starts_with(b"/") {
+             use std::os::unix::ffi::OsStrExt;
+             let is_allowed_system = self.manifest.readonly_mounts.iter().any(|prefix| {
+                  let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();
+                  path_bytes.starts_with(prefix_bytes)
+             });
+             
+             if is_allowed_system {
+                  return Ok(self.resp_continue(req));
+             }
+        }
+
          let root_handle = match std::fs::File::open(&self.project_root) {
              Ok(f) => f,
              Err(e) => {
