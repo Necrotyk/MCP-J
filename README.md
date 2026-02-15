@@ -75,3 +75,59 @@ This project has undergone significant security hardening, including memory safe
 ## License
 
 MIT / Apache-2.0
+
+### 📊 Structured Telemetry
+
+The runtime now emits high-fidelity, structured JSON logs via `tracing`. This allows for programmatic monitoring and SIEM integration.
+
+Each log entry is a JSON object containing:
+- `timestamp`: ISO 8601 timestamp.
+- `level`: Log level (INFO, WARN, ERROR).
+- `message`: Human-readable event description.
+- `target`: The Rust module source.
+- Contextual fields: `pid`, `path`, `dst_ip`, `error`, etc.
+
+**Example Blocked Connection:**
+```json
+{
+  "timestamp": "2024-02-14T21:00:00.000Z",
+  "level": "WARN",
+  "message": "Blocked outbound connection to IPv4",
+  "target": "mcp_j_engine::seccomp_loop",
+  "pid": 1234,
+  "dst_ip": "192.168.1.1"
+}
+```
+
+### 📜 Declarative Execution Manifests
+
+You can now configure the sandbox environment using a JSON manifest file via the `--manifest` flag.
+
+**Usage:**
+```bash
+cargo run -p mcp-j-cli -- --manifest sandbox_config.json /usr/bin/python3 app.py
+```
+
+**Schema (`sandbox_config.json`):**
+```json
+{
+  "max_memory_mb": 1024,
+  "allowed_egress_ips": [
+    "127.0.0.1",
+    "10.0.0.5"
+  ],
+  "readonly_mounts": [
+    "/bin",
+    "/usr/bin",
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/opt/my-libs"
+  ],
+  "env_vars": {
+    "RUST_LOG": "info",
+    "MY_API_KEY": "secret"
+  }
+}
+```
+If no manifest is provided, secure defaults (512MB RAM, localhost-only network, standard system paths) are used.

@@ -3,6 +3,9 @@ pub mod seccomp_loop;
 pub mod landlock_ruleset;
 pub mod fs_utils;
 pub mod seccomp_sys;
+pub mod manifest;
+
+pub use manifest::SandboxManifest;
 
 // TODO: Integrate seccomp-stream when available or use alternative seccomp handling.
 // Dependency: seccomp-stream = { git = "https://github.com/firecracker-microvm/seccomp-stream" }

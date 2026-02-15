@@ -9,12 +9,14 @@ use anyhow::{Result, Context};
 use crate::landlock_ruleset::LandlockRuleset;
 use crate::seccomp_loop::SeccompLoop;
 
+use crate::SandboxManifest;
+
 pub struct Supervisor {
     command: PathBuf,
     args: Vec<String>,
     landlock_ruleset: LandlockRuleset,
     project_root: PathBuf,
-    env_vars: std::collections::HashMap<String, String>,
+    manifest: SandboxManifest,
 }
 
 impl Supervisor {
@@ -22,14 +24,14 @@ impl Supervisor {
         command: PathBuf, 
         args: Vec<String>, 
         project_root: PathBuf,
-        env_vars: std::collections::HashMap<String, String>
+        manifest: SandboxManifest
     ) -> Result<Self> {
         Ok(Self {
             command,
             args,
             landlock_ruleset: LandlockRuleset::new()?,
             project_root,
-            env_vars,
+            manifest,
         })
     }
 
@@ -41,8 +43,9 @@ impl Supervisor {
     pub fn spawn(mut self) -> Result<JailedChild> {
         // Automatically allow reading the executable we are about to run
         self.landlock_ruleset = self.landlock_ruleset.allow_read(&self.command);
-        for lib_path in ["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/bin", "/usr/bin"] {
-            self.landlock_ruleset = self.landlock_ruleset.allow_read(lib_path);
+        // Also allow read on manifest mounts
+        for mount_path in &self.manifest.readonly_mounts {
+            self.landlock_ruleset = self.landlock_ruleset.allow_read(mount_path);
         }
 
         // Create Seccomp Notify Socketpair
@@ -64,7 +67,7 @@ impl Supervisor {
                 unistd::close(stdin_read.as_raw_fd()).ok();
                 unistd::close(stdout_write.as_raw_fd()).ok();
                 
-                println!("Supervisor: Started child with PID {}", child);
+                tracing::info!(pid = %child, "Supervisor: Started child");
 
                 // Receive the notification FD from child
                 let notify_fd = self.receive_notify_fd(parent_sock.as_raw_fd())?;
@@ -73,10 +76,11 @@ impl Supervisor {
                 // Start Seccomp Loop in background thread
                 let loop_root = self.project_root.clone();
                 let allowed_cmd = self.command.clone();
-                let seccomp_loop = SeccompLoop::new(notify_fd, loop_root, allowed_cmd);
+                let manifest_clone = self.manifest.clone();
+                let seccomp_loop = SeccompLoop::new(notify_fd, loop_root, allowed_cmd, manifest_clone);
                 std::thread::spawn(move || {
                     if let Err(e) = seccomp_loop.run() {
-                        eprintln!("Seccomp loop error: {}", e);
+                        tracing::error!(error = %e, "Seccomp loop error");
                     }
                 });
                 
@@ -113,7 +117,7 @@ impl Supervisor {
                 unistd::close(stdout_w_fd).ok();
 
                 if let Err(e) = self.setup_child(child_sock.as_raw_fd()) {
-                    eprintln!("Child setup failed: {}", e);
+                    tracing::error!(error = %e, "Child setup failed");
                     std::process::exit(1);
                 }
                 
@@ -121,16 +125,10 @@ impl Supervisor {
                 let err = Command::new(&self.command)
                     .args(&self.args)
                     .env_clear() // Critical: Strip host environment
-                    .envs(&self.env_vars) // Whitelisted env vars
+                    .envs(&self.manifest.env_vars) // Whitelisted env vars
                     .exec();
                     
-                eprintln!("Failed to exec: {}", err);
-                // Also trace
-                // tracing::error!(error = %err, "Failed to exec");
-                // Since this is child process post-fork, structured logging setup in parent might not apply?
-                // Parent set up `tracing_subscriber` which writes to stdout/stderr.
-                // Child duplicates stdout/stderr. So it should work.
-                // We'll leave eprintln as fallback or use println to ensure it hits the pipe.
+                tracing::error!(error = %err, "Failed to exec");
                 std::process::exit(1);
             }
             Err(e) => {
@@ -169,16 +167,17 @@ impl Supervisor {
         // Attempt to create cgroup and limit resource
         // We do this before unsharing/pivoting so we see host /sys/fs/cgroup
         if let Err(e) = std::fs::create_dir(&cgroup_path) {
-             eprintln!("Warning: Failed to create cgroup {}: {}. Resource limits might not be applied.", cgroup_path.display(), e);
+             tracing::warn!(path = ?cgroup_path, error = %e, "Failed to create cgroup. Resource limits might not be applied.");
         } else {
              // Add self to cgroup
              if let Err(e) = std::fs::write(cgroup_path.join("cgroup.procs"), pid.to_string()) {
-                 eprintln!("Warning: Failed to add pid to cgroup: {}", e);
+                 tracing::warn!(error = %e, "Failed to add pid to cgroup");
              }
              
-             // Set memory limit 512MB
-             if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), "536870912") {
-                 eprintln!("Warning: Failed to set memory limit: {}", e);
+             // Set memory limit from manifest
+             let mem_bytes = self.manifest.max_memory_mb * 1024 * 1024;
+             if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), mem_bytes.to_string()) {
+                 tracing::warn!(error = %e, "Failed to set memory limit");
              }
         }
 
@@ -226,18 +225,23 @@ impl Supervisor {
         }
         
         mount(
-             Some(&self.project_root),
-             &workspace_path,
-             None::<&str>,
-             MsFlags::MS_BIND | MsFlags::MS_REC,
-             None::<&str>,
+            Some(&self.project_root),
+            &workspace_path,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
         ).context("Failed to bind mount project root")?;
         
-        for dir in ["bin", "lib", "lib64", "usr"] {
-            let src = PathBuf::from("/").join(dir);
-            let dst = jail_root.join(dir);
+        // Use manifest mounts
+        for mount_path_str in &self.manifest.readonly_mounts {
+            let src = PathBuf::from(mount_path_str);
+            // destination in jail (e.g. /tmp/jail_root/bin)
+            // Strip leading '/' from mount_path to join safely
+            let rel_path = mount_path_str.trim_start_matches('/');
+            let dst = jail_root.join(rel_path);
+            
             if src.exists() {
-                if !dst.exists() { std::fs::create_dir(&dst).ok(); }
+                if !dst.exists() { std::fs::create_dir_all(&dst).ok(); }
                 mount(
                     Some(&src),
                     &dst,
@@ -254,11 +258,11 @@ impl Supervisor {
         }
         
         mount(
-             Some(jail_root),
-             jail_root,
-             None::<&str>,
-             MsFlags::MS_BIND,
-             None::<&str>
+            Some(jail_root),
+            jail_root,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>
         ).context("Failed to bind mount jail root to itself")?;
         
         // Create and mount /proc

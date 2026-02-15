@@ -1,9 +1,15 @@
 use clap::Parser;
 use mcp_j_engine::supervisor::Supervisor;
+use mcp_j_engine::SandboxManifest;
+use anyhow::{Context, Result};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Path to execution manifest (JSON)
+    #[arg(long, short)]
+    manifest: Option<std::path::PathBuf>,
+
     /// Command to execute in the jail
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
@@ -36,12 +42,23 @@ async fn main() -> anyhow::Result<()> {
     let args = cli.command[1..].to_vec();
     let project_root = std::env::current_dir()?;
 
-    // Future: Parse manifest for Env Vars
-    let mut env_vars = std::collections::HashMap::new();
-    env_vars.insert("PATH".to_string(), "/bin:/usr/bin".to_string());
-    env_vars.insert("Term".to_string(), "xterm-256color".to_string());
+    // Parse manifest or use default
+    let mut manifest = if let Some(path) = &cli.manifest {
+         let content = std::fs::read_to_string(path).context("Failed to read manifest")?;
+         serde_json::from_str(&content).context("Failed to parse manifest")?
+    } else {
+         SandboxManifest::default()
+    };
     
-    let supervisor = Supervisor::new(binary, args, project_root, env_vars)?;
+    // Ensure PATH and TERM are present if env_vars is empty or missing them
+    if !manifest.env_vars.contains_key("PATH") {
+        manifest.env_vars.insert("PATH".to_string(), "/bin:/usr/bin".to_string());
+    }
+    if !manifest.env_vars.contains_key("TERM") {
+        manifest.env_vars.insert("TERM".to_string(), "xterm-256color".to_string());
+    }
+
+    let supervisor = Supervisor::new(binary, args, project_root, manifest)?;
     
     // Spawn child
     let mut child = supervisor.spawn()?;

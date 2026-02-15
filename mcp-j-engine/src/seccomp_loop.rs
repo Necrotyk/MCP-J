@@ -12,16 +12,19 @@ use std::io::IoSliceMut;
 
 use std::path::PathBuf;
 
+use crate::SandboxManifest;
+
 #[derive(Clone)]
 pub struct SeccompLoop {
     notify_fd: RawFd,
     project_root: PathBuf,
     allowed_command: PathBuf,
+    manifest: SandboxManifest,
 }
 
 impl SeccompLoop {
-    pub fn new(notify_fd: RawFd, project_root: PathBuf, allowed_command: PathBuf) -> Self {
-        Self { notify_fd, project_root, allowed_command }
+    pub fn new(notify_fd: RawFd, project_root: PathBuf, allowed_command: PathBuf, manifest: SandboxManifest) -> Self {
+        Self { notify_fd, project_root, allowed_command, manifest }
     }
 
     // Helper to read memory from the tracee
@@ -200,11 +203,8 @@ impl SeccompLoop {
         
         match sa_family as i32 {
             libc::AF_UNIX => {
-                 // Allow local unix sockets?
-                 // User didn't specify, but often needed.
-                 // "If local loopback is required... whitelist 127.0.0.1... drop all other routable address spaces".
-                 // AF_UNIX is local. I'll allow it for now or stick to strict interpretations.
-                 // "drop all other routable address spaces". UNIX isn't routable IP space.
+                 // Allow local unix sockets by default per logic, or check?
+                 // UNIX sockets are usually for IPC within namespaces if private.
                  Ok(self.resp_continue(req))
             },
             libc::AF_INET => {
@@ -226,19 +226,24 @@ impl SeccompLoop {
                  }
                  
                  let ip_raw = u32::from_be(sin.sin_addr.s_addr);
+                 let ip_addr = std::net::Ipv4Addr::from(ip_raw);
+                 let ip_str = ip_addr.to_string();
                  
-                 // Whitelist 127.0.0.1 (0x7F000001)
-                 let localhost: u32 = 0x7F000001;
+                 // Use manifest allowed_egress_ips
+                 // Note: manifest IPs are strings.
+                 // We convert to string and check or parse manifest IPs to u32?
+                 // String check is safer/easier for now.
                  
-                 if ip_raw == localhost {
+                 if self.manifest.allowed_egress_ips.contains(&ip_str) {
                       Ok(self.resp_continue(req))
                  } else {
-                      tracing::warn!(pid = tracee_pid, dst_ip = %format!("{:X}", ip_raw), "Blocked outbound connection to IPv4");
+                      tracing::warn!(pid = tracee_pid, dst_ip = %ip_str, "Blocked outbound connection to IPv4");
                       Ok(self.resp_error(req, libc::EACCES))
                  }
             },
             libc::AF_INET6 => {
-                 // Block all IPv6 as per instruction "Explicitly drop all other"
+                 // Block all IPv6 unless allowed?
+                 // Does manifest allow IPv6 strings?
                  tracing::warn!(pid = tracee_pid, family = "IPv6", "Blocked outbound connection");
                  Ok(self.resp_error(req, libc::EACCES))
             },
@@ -253,11 +258,7 @@ impl SeccompLoop {
         let ptr = req.data.args[0];
         let tracee_pid = req.pid as pid_t;
         
-        // We read the path. Note that tracee could modify it after we read.
-        // However, we rely on the fact that only specific paths are mounted executably/accessibly 
-        // and we have dropped privileges and namespaces.
-        // The user instruction "Shift execution boundary enforcement: Rely on the MS_RDONLY bind mounts" 
-        // implies that we should check if the path is indeed in one of those mounts.
+        // We read the path.
         
         let path = match self.read_string_tracee(tracee_pid, ptr) {
             Ok(s) => s,
@@ -267,13 +268,11 @@ impl SeccompLoop {
             }
         };
 
-        // Allowed prefixes for binaries (from supervisor mounts)
-        // /bin, /usr/bin, /lib, /lib64, /usr/lib, /usr/lib64
-        // And the original command itself?
-        // The user says "Restrict the path check to ensure the binary resides within these read-only, root-owned mount points."
-        let allowed_prefixes = ["/bin/", "/usr/bin/", "/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/"];
+        // Allowed prefixes for binaries (from manifest mounts)
+        // Also always allow the command itself.
+        // The allowed_command should probably be checked against mounts too if it's absolute?
         
-        let is_allowed = allowed_prefixes.iter().any(|prefix| path.starts_with(prefix)) || path == self.allowed_command.to_string_lossy();
+        let is_allowed = self.manifest.readonly_mounts.iter().any(|prefix| path.starts_with(prefix)) || path == self.allowed_command.to_string_lossy();
 
         if is_allowed {
              Ok(self.resp_continue(req))
@@ -353,7 +352,7 @@ impl SeccompLoop {
              let pidfd = unsafe { libc::syscall(crate::seccomp_sys::SYS_PIDFD_OPEN, tracee_pid, 0) };
              if pidfd < 0 {
                  let err = std::io::Error::last_os_error();
-                 eprintln!("pidfd_open failed: {}", err);
+                 tracing::error!(pid = tracee_pid, error = %err, "pidfd_open failed");
                  // If pidfd_open is blocked or fails, we might want to fail the request or continue with fallback?
                  // But for strict security, we fail.
                  return Ok(self.resp_error(req, 0-libc::ESRCH)); 
