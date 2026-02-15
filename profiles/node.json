@@ -1,0 +1,19 @@
+{
+    "max_memory_mb": 512,
+    "max_cpu_quota_pct": 100,
+    "allowed_egress_ips": [
+        "127.0.0.1"
+    ],
+    "readonly_mounts": [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/usr/lib",
+        "/usr/local/lib/node_modules",
+        "/usr/lib/node_modules",
+        "/etc/alternatives"
+    ],
+    "env_vars": {
+        "NODE_PATH": "/usr/lib/node_modules"
+    }
+}

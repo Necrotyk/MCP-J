@@ -384,10 +384,15 @@ impl Supervisor {
     }
 
     fn install_seccomp_filter(&self) -> Result<RawFd> {
-        use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall};
+        use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall, ScmpArch};
         
         let mut ctx = ScmpFilterContext::new(ScmpAction::Allow)?;
         
+        // Phase 33: Multi-Architecture & Static Compilation
+        // Explicitly add the native architecture to ensure the filter targets the correct ABI.
+        // This is critical when running on mixed-environment hosts or under emulation.
+        ctx.add_arch(ScmpArch::Native)?;
+
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("connect")?)?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("execve")?)?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("bind")?)?;
