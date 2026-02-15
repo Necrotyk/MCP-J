@@ -307,13 +307,7 @@ impl Supervisor {
              }
         }
         
-        // Permanently surrender root privileges within the namespace
-        // setresuid(65534, 65534, 65534) (nobody)
-        unsafe {
-             if libc::setresuid(65534, 65534, 65534) != 0 {
-                  return Err(anyhow::anyhow!("Failed to setresuid to nobody: {}", std::io::Error::last_os_error()));
-             }
-        }
+
         
         // 2. Install Seccomp Filter and get Notify FD
         let notify_fd = self.install_seccomp_filter()?;

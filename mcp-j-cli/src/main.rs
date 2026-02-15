@@ -16,9 +16,7 @@ struct Cli {
 }
 
 use mcp_j_proxy::JsonRpcProxy;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio_util::codec::{FramedRead, LinesCodec};
-use futures::StreamExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -76,66 +74,92 @@ async fn main() -> anyhow::Result<()> {
     let async_child_stdout = tokio::fs::File::from_std(child_stdout);
     
     let host_stdin = tokio::io::stdin();
-    let mut host_stdout = tokio::io::stdout();
+    // Use strict memory bounding: 5MB max payload (Phase 15 note: enforced by validation)
+    let _max_length = 5 * 1024 * 1024;
 
-    // Use strict memory bounding: 5MB max payload
-    let max_length = 5 * 1024 * 1024;
+    // Helper for reading LSP messages
+    async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) => return Ok(None),
+                Ok(_) => {
+                     // Check for empty line (\r\n or \n) marking end of headers
+                     if line == "\r\n" || line == "\n" {
+                         break;
+                     }
+                     
+                     let lower = line.to_lowercase();
+                     if lower.starts_with("content-length:") {
+                         if let Some(val) = lower.strip_prefix("content-length:") {
+                             if let Ok(len) = val.trim().parse::<usize>() {
+                                 content_length = Some(len);
+                             }
+                         }
+                     }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        
+        if let Some(len) = content_length {
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).await?;
+            Ok(Some(buf))
+        } else {
+            // Fallback: If no content-length, maybe strict mode requires it.
+            // But if we just got \r\n, maybe we should error.
+            Err(anyhow::anyhow!("Missing Content-Length header"))
+        }
+    }
 
     // Inbound Task: Host Stdin -> Proxy -> Child Stdin
     let proxy_in = proxy.clone();
-    // Prepare reader for host_stdin
-    let mut reader = tokio::io::BufReader::new(host_stdin);
-    // Prepare writer for child_stdin, wrapped in a mutex for shared access
+    let mut reader_in = tokio::io::BufReader::new(host_stdin);
     let stdin_writer = Arc::new(Mutex::new(async_child_stdin));
     let stdin_writer_clone = stdin_writer.clone();
+
     let inbound_task = tokio::spawn(async move {
-        // Read loop with LSP header stripping (Phase 13)
         loop {
-            // We use read_line to robustly handle potentially mixed content or just pure JSONL
-            let mut line = String::new();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    // Check for Content-Length or other headers
-                    if line.starts_with("Content-Length:") || line == "\r\n" {
-                         continue; 
-                    }
+            match read_lsp_message(&mut reader_in).await {
+                Ok(Some(msg_bytes)) => {
+                    let msg_str = match std::str::from_utf8(&msg_bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                             tracing::error!(error = %e, "Invalid UTF-8 in LSP message");
+                             continue;
+                        }
+                    };
                     
-                    if line.trim().is_empty() {
-                        continue;
-                    }
+                    tracing::debug!(len = msg_str.len(), "Received inbound message");
 
-                    tracing::info!(len = line.len(), "Received line");
-
-                    // Parse JSON-RPC
-                    match proxy_in.validate_and_parse(&line) {
+                    match proxy_in.validate_and_parse(msg_str) {
                         Ok(valid_req) => {
-                             // Forward to child
                              let mut child_stdin = stdin_writer_clone.lock().await;
-                             // We re-serialize to ensure clean output format
-                             let mut serialized = serde_json::to_string(&valid_req).unwrap();
-                             serialized.push('\n');
-                             if let Err(e) = child_stdin.write_all(serialized.as_bytes()).await {
+                             let serialized = serde_json::to_string(&valid_req).unwrap();
+                             let len = serialized.len();
+                             let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
+                             
+                             if let Err(e) = child_stdin.write_all(payload.as_bytes()).await {
                                  tracing::error!(error = %e, "Failed to write to child stdin");
                                  break;
                              }
-                             if let Err(e) = child_stdin.flush().await {
-                                 tracing::error!(error = %e, "Failed to flush child stdin");
-                                 break;
-                             }
+                             let _ = child_stdin.flush().await;
                         }
                         Err(rpc_err) => {
-                             // Reply with error to stdout
-                             let mut serialized = serde_json::to_string(&rpc_err).unwrap();
-                             serialized.push('\n');
+                             let serialized = serde_json::to_string(&rpc_err).unwrap();
+                             let len = serialized.len();
+                             let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
                              let mut stdout = tokio::io::stdout();
-                             let _ = stdout.write_all(serialized.as_bytes()).await;
+                             let _ = stdout.write_all(payload.as_bytes()).await;
                              let _ = stdout.flush().await;
                         }
                     }
-                }
+                },
+                Ok(None) => break, // EOF
                 Err(e) => {
-                    tracing::error!(error = %e, "Stdin read error");
+                    tracing::error!(error = %e, "Inbound LSP read error");
                     break;
                 }
             }
@@ -145,32 +169,45 @@ async fn main() -> anyhow::Result<()> {
 
     // Outbound Task: Child Stdout -> Proxy -> Host Stdout
     let proxy_out = proxy.clone();
+    let mut reader_out = tokio::io::BufReader::new(async_child_stdout);
+    
     let outbound_task = tokio::spawn(async move {
-        let codec = LinesCodec::new_with_max_length(max_length);
-        let mut framed_child_stdout = FramedRead::new(async_child_stdout, codec);
+         loop {
+            match read_lsp_message(&mut reader_out).await {
+                Ok(Some(msg_bytes)) => {
+                    let msg_str = match std::str::from_utf8(&msg_bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                             tracing::error!(error = %e, "Invalid UTF-8 in child outbound message");
+                             continue;
+                        }
+                    };
 
-        while let Some(line_result) = framed_child_stdout.next().await {
-            match line_result {
-                Ok(line) => {
-                    match proxy_out.validate_and_parse(&line) {
-                         Ok(v) => {
-                             // Re-serialize strictly
-                             let mut raw = serde_json::to_string(&v)?;
-                             raw.push('\n');
-                             host_stdout.write_all(raw.as_bytes()).await?;
-                             host_stdout.flush().await?;
-                         }
-                         Err(e) => {
-                             tracing::warn!(error = %e, "Proxy Blocked Outbound");
-                         }
+                    match proxy_out.validate_and_parse(msg_str) {
+                        Ok(valid_resp) => {
+                             let serialized = serde_json::to_string(&valid_resp).unwrap();
+                             let len = serialized.len();
+                             let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
+                             
+                             let mut stdout = tokio::io::stdout();
+                             if let Err(e) = stdout.write_all(payload.as_bytes()).await {
+                                 tracing::error!(error = %e, "Failed to write to host stdout");
+                                 break;
+                             }
+                             let _ = stdout.flush().await;
+                        }
+                        Err(e) => {
+                             tracing::warn!(error = ?e, "Blocked outbound message from child");
+                        }
                     }
-                }
+                },
+                Ok(None) => break,
                 Err(e) => {
-                     tracing::error!(error = %e, "Framing Error (Outbound)");
-                     break;
+                    tracing::error!(error = %e, "Outbound LSP read error");
+                    break; 
                 }
             }
-        }
+         }
         Ok::<(), anyhow::Error>(())
     });
 

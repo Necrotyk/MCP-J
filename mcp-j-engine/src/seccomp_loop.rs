@@ -58,8 +58,8 @@ impl SeccompLoop {
         Ok(buf)
     }
 
-    // Helper to read a string from tracee memory (page aligned)
-    fn read_string_tracee(&self, pid: pid_t, addr: u64) -> Result<String> {
+    // Helper to read path bytes from tracee memory (page aligned)
+    fn read_path_tracee(&self, pid: pid_t, addr: u64) -> Result<Vec<u8>> {
         let mut path_buf = Vec::new();
         let max_len = 4096;
         let page_size = 4096;
@@ -67,7 +67,7 @@ impl SeccompLoop {
         
         loop {
             if path_buf.len() >= max_len {
-                return Err(anyhow::anyhow!("String too long"));
+                return Err(anyhow::anyhow!("Path too long"));
             }
             
             // Calculate distance to next page boundary
@@ -99,15 +99,13 @@ impl SeccompLoop {
                 current_addr += n;
                 if n < chunk_size {
                     // Partial read (EOF/EFAULT on remote?)
-                    // If we didn't find nul, and read less than expected, it's likely error unless string ends exactly at end of readable mapping without nul?
-                    // C strings must be nul terminated.
-                    return Err(anyhow::anyhow!("String not null terminated within readable memory"));
+                    return Err(anyhow::anyhow!("Path not null terminated within readable memory"));
                 }
             }
         }
-
-        let s = std::str::from_utf8(&path_buf).map_err(|_| anyhow::anyhow!("Invalid UTF-8"))?;
-        Ok(s.to_string())
+        
+        // No UTF-8 validation here (Phase 16)
+        Ok(path_buf)
     }
 
     pub fn run(&self) -> Result<()> {
@@ -279,12 +277,11 @@ impl SeccompLoop {
     }
 
     fn handle_execve(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+        use std::os::unix::ffi::OsStrExt;
         let ptr = req.data.args[0];
         let tracee_pid = req.pid as pid_t;
         
-        // We read the path.
-        
-        let path = match self.read_string_tracee(tracee_pid, ptr) {
+        let path_bytes = match self.read_path_tracee(tracee_pid, ptr) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Failed to read execve path: {}", e);
@@ -292,17 +289,18 @@ impl SeccompLoop {
             }
         };
 
-        // Allowed prefixes for binaries (from manifest mounts)
-        // Also always allow the command itself.
-        // The allowed_command should probably be checked against mounts too if it's absolute?
-        
-        let is_allowed = self.manifest.readonly_mounts.iter().any(|prefix| path.starts_with(prefix)) || path == self.allowed_command.to_string_lossy();
+        // Check against readonly mounts prefixes (byte comparison)
+        let is_allowed = self.manifest.readonly_mounts.iter().any(|prefix| {
+            let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();
+            path_bytes.starts_with(prefix_bytes)
+        }) || path_bytes == self.allowed_command.as_os_str().as_bytes();
 
         if is_allowed {
              Ok(self.resp_continue(req))
         } else {
-             // Blocked
-             tracing::warn!(pid = tracee_pid, path = %path, "Blocked execve (Not in allowed RO mounts)");
+             // Reconstruct lossy string for logging
+             let path_lossy = String::from_utf8_lossy(&path_bytes);
+             tracing::warn!(pid = tracee_pid, path = %path_lossy, "Blocked execve (Not in allowed RO mounts)");
              Ok(self.resp_error(req, libc::EACCES))
         }
     }
@@ -316,69 +314,20 @@ impl SeccompLoop {
         let path_ptr = req.data.args[1];
         let tracee_pid = req.pid as pid_t;
         
-        // 1. Read path string from tracee with page-aligned handling
-        let mut path_buf = Vec::new();
-        let max_len = 4096;
-        let page_size = 4096;
-        let mut current_addr = path_ptr as usize;
-        
-        loop {
-            if path_buf.len() >= max_len {
-                return Ok(self.resp_error(req, libc::ENAMETOOLONG));
-            }
-            
-            // Calculate distance to next page boundary
-            let bytes_to_boundary = page_size - (current_addr % page_size);
-            let chunk_size = std::cmp::min(bytes_to_boundary, max_len - path_buf.len());
-            
-            let mut buf = vec![0u8; chunk_size];
-            let mut local_iov = [IoSliceMut::new(&mut buf)];
-            let remote_iov = [RemoteIoVec { base: current_addr, len: chunk_size }];
-            
-            let n = match process_vm_readv(nix::unistd::Pid::from_raw(tracee_pid), &mut local_iov, &remote_iov) {
-                Ok(n) => n,
-                Err(_) => {
-                    if path_buf.is_empty() { return Ok(self.resp_error(req, libc::EFAULT)); }
-                    0 
-                }
-            };
-            
-            if n == 0 && path_buf.is_empty() {
-                return Ok(self.resp_error(req, libc::EFAULT));
-            }
-            
-            let read_slice = &buf[..n];
-            if let Some(pos) = read_slice.iter().position(|&b| b == 0) {
-                path_buf.extend_from_slice(&read_slice[..pos]);
-                break;
-            } else {
-                path_buf.extend_from_slice(read_slice);
-                current_addr += n;
-                if n < chunk_size {
-                    return Ok(self.resp_error(req, libc::EFAULT));
-                }
-            }
-        }
-
-        let path_str = match std::str::from_utf8(&path_buf) {
-            Ok(s) => s,
-            Err(_) => return Ok(self.resp_error(req, libc::EINVAL)),
+        // 1. Read path bytes
+        let path_bytes = match self.read_path_tracee(tracee_pid, path_ptr) {
+             Ok(p) => p,
+             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
         };
 
-        // 2. Resolve Root FD using pidfd_getfd for safety
+        // 2. Resolve Root FD
         use std::os::unix::io::FromRawFd;
         
         let root_handle = if dirfd == -100 { // AT_FDCWD
-             // Use our project root handle
              std::fs::File::open(&self.project_root).map_err(|e| anyhow::anyhow!("Failed to open root {:?}: {}", self.project_root, e))?
         } else {
-             // Use pidfd_open + pidfd_getfd
              let pidfd = unsafe { libc::syscall(crate::seccomp_sys::SYS_PIDFD_OPEN, tracee_pid, 0) };
              if pidfd < 0 {
-                 let err = std::io::Error::last_os_error();
-                 tracing::error!(pid = tracee_pid, error = %err, "pidfd_open failed");
-                 // If pidfd_open is blocked or fails, we might want to fail the request or continue with fallback?
-                 // But for strict security, we fail.
                  return Ok(self.resp_error(req, 0-libc::ESRCH)); 
              }
              
@@ -386,7 +335,6 @@ impl SeccompLoop {
              unsafe { libc::close(pidfd as i32) };
              
              if dup_fd < 0 {
-                  // EBADF probably
                   return Ok(self.resp_error(req, libc::EBADF));
              }
              
@@ -396,10 +344,11 @@ impl SeccompLoop {
         // 3. Perform safe open
         let flags = req.data.args[2]; // openat(dirfd, path, flags, mode)
         let mode = req.data.args[3];
-        let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str, flags, mode) {
+        let file = match crate::fs_utils::safe_open_beneath(&root_handle, &path_bytes, flags, mode) {
             Ok(f) => f,
             Err(e) => {
-                tracing::warn!(pid = tracee_pid, path = %path_str, error = %e, "Blocked openat access");
+                let path_lossy = String::from_utf8_lossy(&path_bytes);
+                tracing::warn!(pid = tracee_pid, path = %path_lossy, error = %e, "Blocked openat access");
                 return Ok(self.resp_error(req, libc::EACCES));
             }
         };
@@ -442,7 +391,7 @@ impl SeccompLoop {
          let mode = req.data.args[2];
          
          let tracee_pid = req.pid as pid_t;
-         let path_str = match self.read_string_tracee(tracee_pid, ptr) {
+         let path_bytes = match self.read_path_tracee(tracee_pid, ptr) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(pid = tracee_pid, error = %e, "Failed to read open path");
@@ -458,7 +407,7 @@ impl SeccompLoop {
              }
          };
          
-         match crate::fs_utils::safe_open_beneath(&root_handle, &path_str, flags, mode) {
+         match crate::fs_utils::safe_open_beneath(&root_handle, &path_bytes, flags, mode) {
             Ok(file) => {
                 let injected = self.inject_fd(req, file.as_raw_fd())?;
                 Ok(seccomp_notif_resp {
@@ -469,7 +418,8 @@ impl SeccompLoop {
                 })
             }
             Err(e) => {
-                tracing::warn!(pid = tracee_pid, path = %path_str, error = %e, "Blocked open(legacy) access");
+                let path_lossy = String::from_utf8_lossy(&path_bytes);
+                tracing::warn!(pid = tracee_pid, path = %path_lossy, error = %e, "Blocked open(legacy) access");
                 Ok(self.resp_error(req, libc::EACCES))
             }
          }

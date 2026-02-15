@@ -23,8 +23,10 @@ MCP-J is a hardened, secure runtime environment for executing untrusted [Model C
 - **Resource Constraints**: Cgroups v2 integration limits the agent to **512MB** of memory to prevent Denial-of-Service (DoS) via resource exhaustion.
 
 ### ⚡ Secure IPC Proxy
+- **Strict MCP/LSP Transport**: Fully compliant with the standard Model Context Protocol transport specification, enforcing `Content-Length` headers and `\r\n\r\n` delimiters for deterministic message framing.
 - **Memory Safety**: Enforces a strict **5MB** payload limit on JSON-RPC messages to prevent heap exhaustion.
 - **Protocol Compliance**: A fully JSON-RPC 2.0 compliant proxy validates and sanitizes all messages between the host and method.
+- **Byte-Safe Path Handling**: Internal logic uses raw byte paths (`Vec<u8>`) to correctly handle non-UTF8 filenames on Linux, preventing panics and access control bypasses.
 - **Error Handling**: Gracefully handles protocol violations with structured error responses, ensuring IDE stability.
 - **IDE Compatibility**: All structured telemetry and logs are emitted to `stderr`, preserving the `stdout` channel exclusively for JSON-RPC messages.
 

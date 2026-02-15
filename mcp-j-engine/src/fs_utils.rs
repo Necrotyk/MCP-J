@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::Path;
+
 use anyhow::{Result, Context};
 use libc::c_long;
 
@@ -18,12 +18,12 @@ struct open_how {
     resolve: u64,
 }
 
-pub fn safe_open_beneath<P: AsRef<Path>>(root: &File, path: P, flags: u64, mode: u64) -> Result<File> {
-    use std::os::unix::ffi::OsStrExt;
+pub fn safe_open_beneath(root: &File, path_bytes: &[u8], flags: u64, mode: u64) -> Result<File> {
+    use std::ffi::CString;
     
-    // Byte-safe CString conversion (Phase 12)
-    let path_bytes = path.as_ref().as_os_str().as_bytes();
-    let path_cstr = std::ffi::CString::new(path_bytes).context("Failed to create CString from path bytes")?;
+    // Byte-safe CString conversion (Phase 16)
+    // We expect path_bytes to NOT contain null bytes in the middle, but if they do, CString::new checks.
+    let path_cstr = CString::new(path_bytes).context("Failed to create CString from path bytes")?;
     
     // Mask allowed flags.
     let allowed_mask = (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_APPEND) as u64;
