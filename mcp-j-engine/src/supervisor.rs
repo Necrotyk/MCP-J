@@ -271,6 +271,13 @@ impl Supervisor {
         unistd::chdir("/workspace").context("Failed to chdir to workspace")?;
 
         // --- PHASE 2: Capability Dropping & UID Downgrade ---
+        // Bind lifecycle to parent (supervisor) before dropping privileges
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                 return Err(anyhow::anyhow!("Failed to set PR_SET_PDEATHSIG"));
+            }
+        }
+
         for cap in 0..=63 {
              unsafe {
                  libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
@@ -322,6 +329,8 @@ impl Supervisor {
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("connect")?)?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("execve")?)?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("bind")?)?;
+        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("openat")?)?;
+        ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("open")?)?; // Legacy open, maps to openat often but good to catch.
         
         ctx.load()?;
         

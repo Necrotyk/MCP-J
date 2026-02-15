@@ -122,7 +122,7 @@ impl JsonRpcProxy {
     }
 
     fn validate_arguments(&self, args: &Value) -> Result<(), String> {
-        // Recursive validation for shell injection patterns in arguments
+        // Strict Argument Validation
         match args {
             Value::String(s) => {
                 // Heuristic: Check for obvious shell injection markers

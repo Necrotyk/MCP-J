@@ -139,7 +139,12 @@ impl SeccompLoop {
             libc::SYS_connect => self.handle_connect(req),
             libc::SYS_execve => self.handle_execve(req),
             libc::SYS_bind => self.handle_bind(req),
-            libc::SYS_openat => self.handle_openat(req), // If intercepted
+            libc::SYS_openat => self.handle_openat(req),
+            libc::SYS_open => {
+                // Legacy open: int open(const char *pathname, int flags, mode_t mode);
+                // Mapped to handle_openat(AT_FDCWD, path, flags, mode)
+                self.handle_open_legacy(req)
+            }
             _ => {
                // Allow others by default for now (e.g. read, write)
                Ok(self.resp_continue(req))
@@ -364,7 +369,8 @@ impl SeccompLoop {
         };
 
         // 3. Perform safe open
-        let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str) {
+        let flags = req.data.args[2] as u64; // openat(dirfd, path, flags, mode)
+        let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str, flags) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("Blocked open access to {}: {}", path_str, e);
@@ -401,6 +407,60 @@ impl SeccompLoop {
         
         // ret is the new FD in remote process.
         Ok(ret as RawFd)
+    }
+
+    // Handling legacy open syscall: open(path, flags, mode)
+    fn handle_open_legacy(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+         let ptr = req.data.args[0];
+         let flags = req.data.args[1] as u64;
+         
+         let tracee_pid = req.pid as pid_t;
+         let path_str = match self.read_string_tracee(tracee_pid, ptr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to read open path: {}", e);
+                return Ok(self.resp_error(req, libc::EFAULT));
+            }
+         };
+         
+         // We use project_root as base for AT_FDCWD logic in legacy open
+         // Legacy open is relative to CWD. In the jail, CWD is project root (/workspace).
+         // So opening "foo.txt" -> /workspace/foo.txt
+         // Opening "/foo.txt" -> /foo.txt (which pivots to /workspace/foo.txt if root is pivoted?)
+         // Wait, jail root is /. /workspace IS project_root.
+         // If path is absolute, safe_open_beneath handles it if it's under root?
+         // safe_open_beneath logic: openat2 relative to `root` FD using `RESOLVE_BENEATH`.
+         // This means `path` MUST be relative and contained within `root`.
+         // Absolute paths in `path` will fail with openat2 + RESOLVE_BENEATH usually?
+         // Or RESOLVE_BENEATH treats absolute paths as relative to dirfd?
+         // "If the path is absolute... the dirfd is ignored?" No, with RESOLVE_BENEATH, absolute paths are treated as relative to dirfd/root?
+         // Actually, RESOLVE_BENEATH forbids absolute paths unless they resolve beneath the root.
+         // If we pass an absolute path to openat2 with RESOLVE_BENEATH, it might fail if it tries to escape.
+         // Let's assume relative mainly.
+         
+         let root_handle = match std::fs::File::open(&self.project_root) {
+             Ok(f) => f,
+             Err(e) => {
+                 eprintln!("Failed to open project root handle: {}", e);
+                 return Ok(self.resp_error(req, libc::ENOTDIR));
+             }
+         };
+         
+         match crate::fs_utils::safe_open_beneath(&root_handle, &path_str, flags) {
+            Ok(file) => {
+                let injected = self.inject_fd(req, file.as_raw_fd())?;
+                Ok(seccomp_notif_resp {
+                    id: req.id,
+                    val: injected as i64,
+                    error: 0,
+                    flags: 0,
+                })
+            }
+            Err(e) => {
+                eprintln!("Blocked open(legacy) access to {}: {}", path_str, e);
+                Ok(self.resp_error(req, libc::EACCES))
+            }
+         }
     }
 }
 

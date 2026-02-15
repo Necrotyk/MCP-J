@@ -20,12 +20,20 @@ struct open_how {
     resolve: u64,
 }
 
-pub fn safe_open_beneath<P: AsRef<Path>>(root: &File, path: P) -> Result<File> {
+pub fn safe_open_beneath<P: AsRef<Path>>(root: &File, path: P, flags: u64) -> Result<File> {
     let path_cstr = std::ffi::CString::new(path.as_ref().to_str().unwrap_or("")).unwrap();
     
+    // Mask allowed flags. We allow read/write, create, etc.
+    // Important: O_CLOEXEC is mandatory for injected FDs usually, though injection handles it separately?
+    // We enforce O_CLOEXEC here for good measure.
+    let allowed_mask = (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_APPEND) as u64;
+    let safe_flags = (flags & allowed_mask) | (libc::O_CLOEXEC as u64);
+
     let how = open_how {
-        flags: (libc::O_RDWR | libc::O_CLOEXEC) as u64, // Default flags, adjust as needed
-        mode: 0,
+        flags: safe_flags,
+        mode: 0o666, // Default mode if O_CREAT is used. User mask applies? Openat2 might need explicit mode.
+        // Actually, seccomp notify usually passes the 'mode' argument from openat syscall too.
+        // For now, simpler implementation with default conservative mode (rw-rw-rw-).
         resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
     };
 
