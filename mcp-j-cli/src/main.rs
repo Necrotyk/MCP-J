@@ -1,7 +1,7 @@
 use clap::Parser;
 use mcp_j_engine::supervisor::Supervisor;
 use mcp_j_engine::SandboxManifest;
-use anyhow::{Context};
+use anyhow::Context;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -19,6 +19,7 @@ use mcp_j_proxy::JsonRpcProxy;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::signal::unix::{signal, SignalKind};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,15 +35,12 @@ async fn main() -> anyhow::Result<()> {
     
     tracing::info!(command = ?cli.command, "Launching jailed process");
     
-    // Check kernel version
     mcp_j_engine::check_kernel_compatibility()?;
 
-    // Initialize supervisor
     let binary = std::path::PathBuf::from(&cli.command[0]);
     let args = cli.command[1..].to_vec();
     let project_root = std::env::current_dir()?;
 
-    // Parse manifest or use default
     let mut manifest = if let Some(path) = &cli.manifest {
          let content = std::fs::read_to_string(path).context("Failed to read manifest")?;
          serde_json::from_str(&content).context("Failed to parse manifest")?
@@ -50,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
          SandboxManifest::default()
     };
     
-    // Ensure PATH and TERM are present if env_vars is empty or missing them
+    // Enforce PATH and TERM defaults if omitted
     if !manifest.env_vars.contains_key("PATH") {
         manifest.env_vars.insert("PATH".to_string(), "/bin:/usr/bin".to_string());
     }
@@ -59,14 +57,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let supervisor = Supervisor::new(binary, args, project_root, manifest)?;
-    
-    // Spawn child
     let mut child = supervisor.spawn()?;
 
-    // Setup Proxy
     let proxy = Arc::new(JsonRpcProxy::new());
     
-    // Convert std files to tokio files
     let child_stdin = child.stdin.take().expect("Child stdin missing");
     let child_stdout = child.stdout.take().expect("Child stdout missing");
     
@@ -74,10 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let async_child_stdout = tokio::fs::File::from_std(child_stdout);
     
     let host_stdin = tokio::io::stdin();
-    // Use strict memory bounding: 5MB max payload (Phase 15 note: enforced by validation)
-    let _max_length = 5 * 1024 * 1024;
 
-    // Helper for reading LSP messages
     async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
         let mut content_length = None;
         loop {
@@ -85,7 +76,6 @@ async fn main() -> anyhow::Result<()> {
             match reader.read_line(&mut line).await {
                 Ok(0) => return Ok(None),
                 Ok(_) => {
-                     // Check for empty line (\r\n or \n) marking end of headers
                      if line == "\r\n" || line == "\n" {
                          break;
                      }
@@ -107,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
             const MAX_PAYLOAD_SIZE: usize = 5 * 1024 * 1024;
             if len > MAX_PAYLOAD_SIZE {
                 return Err(anyhow::anyhow!(
-                    "Payload size {} exceeds maximum allowed limit of {} bytes",
+                    "Payload size {} exceeds limit of {} bytes",
                     len,
                     MAX_PAYLOAD_SIZE
                 ));
@@ -117,8 +107,6 @@ async fn main() -> anyhow::Result<()> {
             reader.read_exact(&mut buf).await?;
             Ok(Some(buf))
         } else {
-            // Fallback: If no content-length, maybe strict mode requires it.
-            // But if we just got \r\n, maybe we should error.
             Err(anyhow::anyhow!("Missing Content-Length header"))
         }
     }
@@ -141,8 +129,6 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
                     
-                    tracing::debug!(len = msg_str.len(), "Received inbound message");
-
                     match proxy_in.validate_and_parse(msg_str) {
                         Ok(valid_req) => {
                              let mut child_stdin = stdin_writer_clone.lock().await;
@@ -166,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 },
-                Ok(None) => break, // EOF
+                Ok(None) => break,
                 Err(e) => {
                     tracing::error!(error = %e, "Inbound LSP read error");
                     break;
@@ -220,24 +206,39 @@ async fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
+    let child_pid = child.pid.as_raw();
+    
     // Wait for child exit
     let wait_task = tokio::task::spawn_blocking(move || {
         child.wait()
     });
     
-    // Race tasks
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
     tokio::select! {
-        _ = inbound_task => {}, // Stdin closed
-        _ = outbound_task => {}, // Child stdout closed (child likely exited)
+        _ = inbound_task => {
+            tracing::debug!("Host stdin closed. Terminating.");
+        },
+        _ = outbound_task => {
+            tracing::debug!("Child stdout closed. Terminating.");
+        },
         res = wait_task => {
             match res {
                 Ok(Ok(status)) => tracing::info!(status = ?status, "Child exited"),
                 Ok(Err(e)) => tracing::error!(error = %e, "Wait failed"),
                 Err(e) => tracing::error!(error = %e, "Join error"),
             }
+        },
+        _ = sigint.recv() => {
+            tracing::warn!("SIGINT trapped. Executing strict teardown sequence.");
+            let _ = std::process::Command::new("kill").arg("-9").arg(child_pid.to_string()).status();
+        },
+        _ = sigterm.recv() => {
+            tracing::warn!("SIGTERM trapped. Executing strict teardown sequence.");
+            let _ = std::process::Command::new("kill").arg("-9").arg(child_pid.to_string()).status();
         }
     }
 
     Ok(())
 }
-
