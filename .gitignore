@@ -1,32 +1,41 @@
-# Rust
-/target/
+# --- Build Artifacts (Rust) ---
+target/
+**/target/
 **/*.rs.bk
-Cargo.lock
+# Note: Keep root Cargo.lock for binary reproducibility, 
+# but ignore lock files in workspace members if they exist.
+# mcp-j-cli/Cargo.lock
+# mcp-j-engine/Cargo.lock
 
-# IDEs and Editors
+# --- Build Artifacts (Node/VS Code) ---
+node_modules/
+**/node_modules/
+clients/vscode-mcp-j/out/
+clients/vscode-mcp-j/dist/
+clients/vscode-mcp-j/*.vsix
+clients/vscode-mcp-j/.vscode-test/
+*.tsbuildinfo
+
+# --- Fuzzing ---
+fuzz/target/
+**/fuzz/target/
+**/fuzz/corpus/
+**/fuzz/artifacts/
+
+# --- Logs and Diagnostics ---
+*.log
+check.stderr
+*.out
+
+# --- IDEs and Editors ---
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+.history/
 
-# OS
+# --- OS Specific ---
 .DS_Store
 .thumbnails/
-
-# Logs
-*.log
-
-# Node & VSCode Extension
-node_modules/
-clients/vscode-mcp-j/node_modules/
-clients/vscode-mcp-j/out/
-clients/vscode-mcp-j/*.vsix
-clients/vscode-mcp-j/.vscode-test/
-
-# Fuzzing artifacts
-fuzz/target/
-mcp-j-proxy/fuzz/target/
-mcp-j-proxy/fuzz/corpus/
-mcp-j-proxy/fuzz/artifacts/
-
+Thumbs.db
