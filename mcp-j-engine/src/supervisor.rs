@@ -282,6 +282,32 @@ impl Supervisor {
             MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
             None::<&str>,
         ).context("Failed to mount /proc")?;
+        
+        // --- PHASE 23: POSIX Device Node Injection ---
+        let dev_path = jail_root.join("dev");
+        if !dev_path.exists() {
+             std::fs::create_dir(&dev_path).context("Failed to create /dev in jail")?;
+        }
+
+        // Mount essential devices
+        for device in &["null", "zero", "urandom"] {
+             let host_dev = PathBuf::from("/dev").join(device);
+             let jail_dev = dev_path.join(device);
+             
+             if !jail_dev.exists() {
+                 std::fs::File::create(&jail_dev).context(format!("Failed to create /dev/{}", device))?;
+             }
+
+             if host_dev.exists() {
+                 mount(
+                     Some(&host_dev),
+                     &jail_dev,
+                     None::<&str>,
+                     MsFlags::MS_BIND | MsFlags::MS_RDONLY, // Read-only for safety
+                     None::<&str>
+                 ).context(format!("Failed to bind mount /dev/{}", device))?;
+             }
+        }
 
         nix::unistd::pivot_root(jail_root, &old_root).context("Failed to pivot root")?;
         

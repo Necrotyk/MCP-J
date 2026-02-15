@@ -293,7 +293,8 @@ impl SeccompLoop {
         let is_allowed = self.manifest.readonly_mounts.iter().any(|prefix| {
             let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();
             path_bytes.starts_with(prefix_bytes)
-        }) || path_bytes == self.allowed_command.as_os_str().as_bytes();
+        }) || path_bytes == self.allowed_command.as_os_str().as_bytes()
+           || path_bytes.starts_with(b"/workspace/"); // Phase 24: Enable Workspace Execution
 
         if is_allowed {
              // Phase 21: TOCTOU Acknowledgment

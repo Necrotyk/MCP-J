@@ -354,6 +354,7 @@ dependencies = [
  "futures",
  "mcp-j-engine",
  "mcp-j-proxy",
+ "nix",
  "serde_json",
  "tokio",
  "tokio-util",

@@ -232,11 +232,11 @@ async fn main() -> anyhow::Result<()> {
         },
         _ = sigint.recv() => {
             tracing::warn!("SIGINT trapped. Executing strict teardown sequence.");
-            let _ = std::process::Command::new("kill").arg("-9").arg(child_pid.to_string()).status();
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), nix::sys::signal::Signal::SIGKILL);
         },
         _ = sigterm.recv() => {
             tracing::warn!("SIGTERM trapped. Executing strict teardown sequence.");
-            let _ = std::process::Command::new("kill").arg("-9").arg(child_pid.to_string()).status();
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), nix::sys::signal::Signal::SIGKILL);
         }
     }
 
