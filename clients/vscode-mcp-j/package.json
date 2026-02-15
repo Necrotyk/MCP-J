@@ -2,7 +2,7 @@
   "name": "vscode-mcp-j",
   "displayName": "MCP-J Secure Runtime",
   "description": "Secure MCP runtime integration for VSCode",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "engines": {
     "vscode": "^1.90.0"
   },
