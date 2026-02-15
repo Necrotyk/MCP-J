@@ -374,22 +374,40 @@ impl CgroupGuard {
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
-        // Phase 10: Annihilate all processes in cgroup before removal
+        // Phase 10 & 18: Annihilate all processes in cgroup with retry before removal
         let procs_path = self.path.join("cgroup.procs");
         
+        // 1. Initial Kill
         if let Ok(content) = std::fs::read_to_string(&procs_path) {
             for line in content.lines() {
                 if let Ok(pid) = line.trim().parse::<i32>() {
-                    // Send SIGKILL to ensure no zombies or daemons persist
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                    }
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
                 }
             }
         }
         
-        // Brief yield/wait might be needed, but usually we just try removing.
-        // A retry loop could be more robust if needed.
+        // 2. Retry Loop (Phase 18)
+        for _ in 0..10 {
+            let mut empty = true;
+            if let Ok(content) = std::fs::read_to_string(&procs_path) {
+                 if !content.trim().is_empty() {
+                     empty = false;
+                     // Re-issue kill just in case
+                     for line in content.lines() {
+                        if let Ok(pid) = line.trim().parse::<i32>() {
+                            unsafe { libc::kill(pid, libc::SIGKILL); }
+                        }
+                     }
+                 }
+            }
+            
+            if empty {
+                break;
+            }
+            
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         // Try removing the directory
         let _ = std::fs::remove_dir(&self.path);
     }

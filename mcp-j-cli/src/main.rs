@@ -104,6 +104,15 @@ async fn main() -> anyhow::Result<()> {
         }
         
         if let Some(len) = content_length {
+            const MAX_PAYLOAD_SIZE: usize = 5 * 1024 * 1024;
+            if len > MAX_PAYLOAD_SIZE {
+                return Err(anyhow::anyhow!(
+                    "Payload size {} exceeds maximum allowed limit of {} bytes",
+                    len,
+                    MAX_PAYLOAD_SIZE
+                ));
+            }
+
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).await?;
             Ok(Some(buf))
