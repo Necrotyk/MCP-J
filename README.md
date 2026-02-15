@@ -131,7 +131,11 @@ cargo run -p mcp-j-cli -- --manifest sandbox_config.json /usr/bin/python3 app.py
   "env_vars": {
     "RUST_LOG": "info",
     "MY_API_KEY": "secret"
-  }
+  },
+  "max_cpu_quota_pct": 50
 }
 ```
-If no manifest is provided, secure defaults (512MB RAM, localhost-only network, standard system paths) are used.
+If no manifest is provided, secure defaults (512MB RAM, 100% CPU quota (1 core), localhost-only network, standard system paths) are used.
+
+### 📝 Stderr Multiplexing
+Standard error from the jailed process is now captured and wrapped in structured JSON logs with `source="tracee_stderr"`. This prevents unstructured text from corrupting the parent IDE's JSON parser while preserving full observability of agent crashes or errors.

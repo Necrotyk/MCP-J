@@ -63,9 +63,11 @@ async fn main() -> anyhow::Result<()> {
     
     let child_stdin = child.stdin.take().expect("Child stdin missing");
     let child_stdout = child.stdout.take().expect("Child stdout missing");
+    let child_stderr = child.stderr.take().expect("Child stderr missing");
     
     let async_child_stdin = tokio::fs::File::from_std(child_stdin);
     let async_child_stdout = tokio::fs::File::from_std(child_stdout);
+    let async_child_stderr = tokio::fs::File::from_std(child_stderr);
     
     let host_stdin = tokio::io::stdin();
 
@@ -206,6 +208,28 @@ async fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
+    // Stderr Task: Child Stderr -> Host Stderr (as structured logs)
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(async_child_stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let trim = line.trim();
+                    if !trim.is_empty() {
+                         tracing::warn!(source = "tracee_stderr", payload = %trim, "Stderr from child");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Child stderr read error");
+                    break;
+                }
+            }
+        }
+    });
+
     let child_pid = child.pid.as_raw();
     
     // Wait for child exit
@@ -222,6 +246,9 @@ async fn main() -> anyhow::Result<()> {
         },
         _ = outbound_task => {
             tracing::debug!("Child stdout closed. Terminating.");
+        },
+        _ = stderr_task => {
+             tracing::debug!("Child stderr closed.");
         },
         res = wait_task => {
             match res {

@@ -14,6 +14,13 @@ pub struct SandboxManifest {
     
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
+
+    #[serde(default = "default_max_cpu_quota_pct")]
+    pub max_cpu_quota_pct: u32,
+}
+
+fn default_max_cpu_quota_pct() -> u32 {
+    100
 }
 
 fn default_max_memory_mb() -> u64 {
@@ -34,6 +41,7 @@ impl Default for SandboxManifest {
                 "/usr/bin".to_string()
             ],
             env_vars: HashMap::new(),
+            max_cpu_quota_pct: 100,
         }
     }
 }

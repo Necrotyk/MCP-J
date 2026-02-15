@@ -48,17 +48,18 @@ impl Supervisor {
             self.landlock_ruleset = self.landlock_ruleset.allow_read(mount_path);
         }
 
-        // Create Seccomp Notify Socketpair
+        // Create Seccomp Notify Socketpair (O_CLOEXEC)
         let (parent_sock, child_sock) = nix::sys::socket::socketpair(
             nix::sys::socket::AddressFamily::Unix,
             nix::sys::socket::SockType::Stream,
             None,
-            nix::sys::socket::SockFlag::empty(),
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
         ).context("Failed to create socketpair")?;
 
-        // Create Stdin/Stdout pipes
-        let (stdin_read, stdin_write) = nix::unistd::pipe().context("Failed to create stdin pipe")?;
-        let (stdout_read, stdout_write) = nix::unistd::pipe().context("Failed to create stdout pipe")?;
+        // Create Stdin/Stdout/Stderr pipes (O_CLOEXEC)
+        let (stdin_read, stdin_write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("Failed to create stdin pipe")?;
+        let (stdout_read, stdout_write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("Failed to create stdout pipe")?;
+        let (stderr_read, stderr_write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("Failed to create stderr pipe")?;
 
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
@@ -66,6 +67,7 @@ impl Supervisor {
                 unistd::close(child_sock.as_raw_fd()).ok(); 
                 unistd::close(stdin_read.as_raw_fd()).ok();
                 unistd::close(stdout_write.as_raw_fd()).ok();
+                unistd::close(stderr_write.as_raw_fd()).ok();
                 
                 tracing::info!(pid = %child, "Supervisor: Started child");
 
@@ -87,11 +89,13 @@ impl Supervisor {
                 // Use unsafe to create File from OwnedFd (by taking raw fd)
                 let stdin_file = unsafe { std::fs::File::from_raw_fd(stdin_write.into_raw_fd()) };
                 let stdout_file = unsafe { std::fs::File::from_raw_fd(stdout_read.into_raw_fd()) };
+                let stderr_file = unsafe { std::fs::File::from_raw_fd(stderr_read.into_raw_fd()) };
 
                 Ok(JailedChild {
                     pid: child,
                     stdin: Some(stdin_file),
                     stdout: Some(stdout_file),
+                    stderr: Some(stderr_file),
                     cgroup_guard: Some(CgroupGuard::new(child.as_raw() as u32)),
                 })
             }
@@ -104,18 +108,23 @@ impl Supervisor {
                 let stdin_w_fd = stdin_write.into_raw_fd();
                 let stdout_r_fd = stdout_read.into_raw_fd();
                 let stdout_w_fd = stdout_write.into_raw_fd();
+                let stderr_r_fd = stderr_read.into_raw_fd();
+                let stderr_w_fd = stderr_write.into_raw_fd();
 
                 // Close unused ends
                 unistd::close(stdin_w_fd).ok(); 
                 unistd::close(stdout_r_fd).ok();
+                unistd::close(stderr_r_fd).ok();
                 
                 // Dup2
                 let _ = unistd::dup2(stdin_r_fd, 0); // Stdin
                 let _ = unistd::dup2(stdout_w_fd, 1); // Stdout
+                let _ = unistd::dup2(stderr_w_fd, 2); // Stderr
                 
                 // Close original FDs
                 unistd::close(stdin_r_fd).ok();
                 unistd::close(stdout_w_fd).ok();
+                unistd::close(stderr_w_fd).ok();
 
                 if let Err(e) = self.setup_child(child_sock.as_raw_fd()) {
                     tracing::error!(error = %e, "Child setup failed");
@@ -182,6 +191,16 @@ impl Supervisor {
              let mem_bytes = self.manifest.max_memory_mb * 1024 * 1024;
              if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), mem_bytes.to_string()) {
                  tracing::warn!(error = %e, "Failed to set memory limit");
+             }
+             
+             // Set CPU quota (Phase 29)
+             if self.manifest.max_cpu_quota_pct > 0 {
+                  // cpu.max: "quota period" -> "{pct * 1000} 100000" (100000us = 100ms cycle)
+                  let quota = self.manifest.max_cpu_quota_pct * 1000;
+                  let val = format!("{} 100000", quota);
+                  if let Err(e) = std::fs::write(cgroup_path.join("cpu.max"), val) {
+                      tracing::warn!(error = %e, "Failed to set cpu limit");
+                  }
              }
         }
 
@@ -444,6 +463,7 @@ pub struct JailedChild {
     pub pid: nix::unistd::Pid,
     pub stdin: Option<std::fs::File>,
     pub stdout: Option<std::fs::File>,
+    pub stderr: Option<std::fs::File>,
     pub cgroup_guard: Option<CgroupGuard>, // Moved here, or keep in Supervisor context? 
     // Wait, the child is in the cgroup. We can only remove cgroup after all processes in it are gone.
     // So JailedChild should own the guard, and on Drop (after wait), it cleans up.
