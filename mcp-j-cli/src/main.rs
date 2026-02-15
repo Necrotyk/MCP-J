@@ -29,7 +29,12 @@ async fn main() -> anyhow::Result<()> {
     let args = cli.command[1..].to_vec();
     let project_root = std::env::current_dir()?;
 
-    let supervisor = Supervisor::new(binary, args, project_root)?;
+    // Future: Parse manifest for Env Vars
+    let mut env_vars = std::collections::HashMap::new();
+    env_vars.insert("PATH".to_string(), "/bin:/usr/bin".to_string());
+    env_vars.insert("Term".to_string(), "xterm-256color".to_string());
+    
+    let supervisor = Supervisor::new(binary, args, project_root, env_vars)?;
     
     // Spawn child
     let mut child = supervisor.spawn()?;

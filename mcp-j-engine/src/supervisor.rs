@@ -14,15 +14,22 @@ pub struct Supervisor {
     args: Vec<String>,
     landlock_ruleset: LandlockRuleset,
     project_root: PathBuf,
+    env_vars: std::collections::HashMap<String, String>,
 }
 
 impl Supervisor {
-    pub fn new(command: PathBuf, args: Vec<String>, project_root: PathBuf) -> Result<Self> {
+    pub fn new(
+        command: PathBuf, 
+        args: Vec<String>, 
+        project_root: PathBuf,
+        env_vars: std::collections::HashMap<String, String>
+    ) -> Result<Self> {
         Ok(Self {
             command,
             args,
             landlock_ruleset: LandlockRuleset::new()?,
             project_root,
+            env_vars,
         })
     }
 
@@ -113,6 +120,8 @@ impl Supervisor {
                 // Exec
                 let err = Command::new(&self.command)
                     .args(&self.args)
+                    .env_clear() // Critical: Strip host environment
+                    .envs(&self.env_vars) // Whitelisted env vars
                     .exec();
                     
                 eprintln!("Failed to exec: {}", err);
