@@ -125,6 +125,12 @@ impl Supervisor {
                     .exec();
                     
                 eprintln!("Failed to exec: {}", err);
+                // Also trace
+                // tracing::error!(error = %err, "Failed to exec");
+                // Since this is child process post-fork, structured logging setup in parent might not apply?
+                // Parent set up `tracing_subscriber` which writes to stdout/stderr.
+                // Child duplicates stdout/stderr. So it should work.
+                // We'll leave eprintln as fallback or use println to ensure it hits the pipe.
                 std::process::exit(1);
             }
             Err(e) => {

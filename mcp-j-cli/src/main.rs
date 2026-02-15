@@ -17,9 +17,16 @@ use futures::StreamExt; // For .next()
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize structured logging
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_target(false)
+        .init();
+
     let cli = Cli::parse();
     
-    eprintln!("Launching jailed process: {:?}", cli.command);
+    tracing::info!(command = ?cli.command, "Launching jailed process");
     
     // Check kernel version
     mcp_j_engine::check_kernel_compatibility()?;
@@ -77,31 +84,7 @@ async fn main() -> anyhow::Result<()> {
                              async_child_stdin.flush().await?;
                         }
                         Err(err_obj) => {
-                             eprintln!("Proxy Blocked Inbound: {}", err_obj);
-                             // Return JSON-RPC Error to Host Stdin (NOT Child) if it came from Host?
-                             // Wait, inbound is Host -> Child.
-                             // Host sent bad data. We should reply to Host.
-                             // Wait, Host Stdin is where we read. We write to Host Stdout.
-                             // But Host expects response on Stdout.
-                             // We should send the error object back to Host Stdout.
-                             
-                             // We need access to host_stdout?? 
-                             // inbound_task owns framed_stdin (reader). it doesn't own stdout.
-                             // We can't easily write to stdout from here without cloning it or using a channel.
-                             // But wait, the user instructions say:
-                             // "Serialize the generated JSON-RPC error and route it to host_stdout"
-                             
-                             // Re-architect: we need a shared stdout writer or a way to send response.
-                             // Or we just print to stderr?
-                             // "gracefully terminate the IDE's pending future" -> implies writing to stdout.
-                             
-                             // For now, let's just log to stderr as we can't easily access host_stdout here without refactoring main.
-                             // Wait, we can clone `host_stdout` before spawning? `tokio::io::Stdout` is not cloneable easily?
-                             // `tokio::io::stdout()` returns a handle. We can create multiple handles? Yes.
-                             
-                             // But wait, concurrent writes to stdout might interleave.
-                             // Better to use a channel to the outbound task?
-                             // Or just open a new stdout handle.
+                             tracing::warn!(error = ?err_obj, "Proxy Blocked Inbound");
                              
                              let mut stdout = tokio::io::stdout();
                              let mut raw = serde_json::to_string(&err_obj).unwrap_or_default();
@@ -113,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => {
-                     eprintln!("Framing Error (Inbound): {}", e);
+                     tracing::error!(error = %e, "Framing Error (Inbound)");
                      break;
                 }
             }
@@ -139,12 +122,12 @@ async fn main() -> anyhow::Result<()> {
                              host_stdout.flush().await?;
                          }
                          Err(e) => {
-                             eprintln!("Proxy Blocked Outbound: {}", e);
+                             tracing::warn!(error = %e, "Proxy Blocked Outbound");
                          }
                     }
                 }
                 Err(e) => {
-                     eprintln!("Framing Error (Outbound): {}", e);
+                     tracing::error!(error = %e, "Framing Error (Outbound)");
                      break;
                 }
             }
@@ -164,9 +147,9 @@ async fn main() -> anyhow::Result<()> {
         _ = outbound_task => {}, // Child stdout closed (child likely exited)
         res = wait_task => {
             match res {
-                Ok(Ok(status)) => eprintln!("Child exited: {:?}", status),
-                Ok(Err(e)) => eprintln!("Wait failed: {}", e),
-                Err(e) => eprintln!("Join error: {}", e),
+                Ok(Ok(status)) => tracing::info!(status = ?status, "Child exited"),
+                Ok(Err(e)) => tracing::error!(error = %e, "Wait failed"),
+                Err(e) => tracing::error!(error = %e, "Join error"),
             }
         }
     }

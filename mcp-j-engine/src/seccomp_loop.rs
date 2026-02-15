@@ -109,6 +109,7 @@ impl SeccompLoop {
                 }
                 // Handle ENOENT if the target process died?
                 // If checking for closed connection, handle it gracefully.
+                tracing::error!(notify_fd = self.notify_fd, error = %err, "ioctl RECV failed");
                 return Err(anyhow::anyhow!("ioctl RECV failed: {}", err));
             }
 
@@ -232,13 +233,13 @@ impl SeccompLoop {
                  if ip_raw == localhost {
                       Ok(self.resp_continue(req))
                  } else {
-                      eprintln!("Blocked outbound connection to IPv4: {:X}", ip_raw);
+                      tracing::warn!(pid = tracee_pid, dst_ip = %format!("{:X}", ip_raw), "Blocked outbound connection to IPv4");
                       Ok(self.resp_error(req, libc::EACCES))
                  }
             },
             libc::AF_INET6 => {
                  // Block all IPv6 as per instruction "Explicitly drop all other"
-                 eprintln!("Blocked outbound connection to IPv6");
+                 tracing::warn!(pid = tracee_pid, family = "IPv6", "Blocked outbound connection");
                  Ok(self.resp_error(req, libc::EACCES))
             },
             _ => {
@@ -277,7 +278,8 @@ impl SeccompLoop {
         if is_allowed {
              Ok(self.resp_continue(req))
         } else {
-             eprintln!("Blocked execve: {} (Not in allowed RO mounts)", path);
+             // Blocked
+             tracing::warn!(pid = tracee_pid, path = %path, "Blocked execve (Not in allowed RO mounts)");
              Ok(self.resp_error(req, libc::EACCES))
         }
     }
@@ -373,7 +375,7 @@ impl SeccompLoop {
         let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str, flags) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("Blocked open access to {}: {}", path_str, e);
+                tracing::warn!(pid = tracee_pid, path = %path_str, error = %e, "Blocked openat access");
                 return Ok(self.resp_error(req, libc::EACCES));
             }
         };
@@ -418,30 +420,15 @@ impl SeccompLoop {
          let path_str = match self.read_string_tracee(tracee_pid, ptr) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Failed to read open path: {}", e);
+                tracing::error!(pid = tracee_pid, error = %e, "Failed to read open path");
                 return Ok(self.resp_error(req, libc::EFAULT));
             }
          };
          
-         // We use project_root as base for AT_FDCWD logic in legacy open
-         // Legacy open is relative to CWD. In the jail, CWD is project root (/workspace).
-         // So opening "foo.txt" -> /workspace/foo.txt
-         // Opening "/foo.txt" -> /foo.txt (which pivots to /workspace/foo.txt if root is pivoted?)
-         // Wait, jail root is /. /workspace IS project_root.
-         // If path is absolute, safe_open_beneath handles it if it's under root?
-         // safe_open_beneath logic: openat2 relative to `root` FD using `RESOLVE_BENEATH`.
-         // This means `path` MUST be relative and contained within `root`.
-         // Absolute paths in `path` will fail with openat2 + RESOLVE_BENEATH usually?
-         // Or RESOLVE_BENEATH treats absolute paths as relative to dirfd?
-         // "If the path is absolute... the dirfd is ignored?" No, with RESOLVE_BENEATH, absolute paths are treated as relative to dirfd/root?
-         // Actually, RESOLVE_BENEATH forbids absolute paths unless they resolve beneath the root.
-         // If we pass an absolute path to openat2 with RESOLVE_BENEATH, it might fail if it tries to escape.
-         // Let's assume relative mainly.
-         
          let root_handle = match std::fs::File::open(&self.project_root) {
              Ok(f) => f,
              Err(e) => {
-                 eprintln!("Failed to open project root handle: {}", e);
+                 tracing::error!(project_root = ?self.project_root, error = %e, "Failed to open project root handle");
                  return Ok(self.resp_error(req, libc::ENOTDIR));
              }
          };
@@ -457,7 +444,7 @@ impl SeccompLoop {
                 })
             }
             Err(e) => {
-                eprintln!("Blocked open(legacy) access to {}: {}", path_str, e);
+                tracing::warn!(pid = tracee_pid, path = %path_str, error = %e, "Blocked open(legacy) access");
                 Ok(self.resp_error(req, libc::EACCES))
             }
          }

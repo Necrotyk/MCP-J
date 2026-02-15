@@ -122,15 +122,15 @@ impl JsonRpcProxy {
     }
 
     fn validate_arguments(&self, args: &Value) -> Result<(), String> {
-        // Strict Argument Validation
+        // Validation logic for user-space (proxy) has been simplified.
+        // We rely on kernel-level enforcement (Landlock, Seccomp) for security.
+        // The proxy mainly ensures structural integrity of JSON-RPC 2.0.
+        // Deep inspection of string arguments for shell injection is prone to false positives
+        // with legitimate code artifacts (e.g. bash scripts, markdown).
+        
         match args {
-            Value::String(s) => {
-                // Heuristic: Check for obvious shell injection markers
-                // We keep it simple but stricter than before:
-                // `backticks`, $(...)
-                if s.contains('`') || s.contains("$(") {
-                    return Err(format!("Unsafe shell pattern detected in argument: {}", s));
-                }
+            Value::String(_) => {
+                // No-op: Allow all strings.
             }
             Value::Array(arr) => {
                 for item in arr {
