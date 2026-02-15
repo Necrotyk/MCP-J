@@ -17,3 +17,16 @@ Cargo.lock
 # Logs
 *.log
 
+# Node & VSCode Extension
+node_modules/
+clients/vscode-mcp-j/node_modules/
+clients/vscode-mcp-j/out/
+clients/vscode-mcp-j/*.vsix
+clients/vscode-mcp-j/.vscode-test/
+
+# Fuzzing artifacts
+fuzz/target/
+mcp-j-proxy/fuzz/target/
+mcp-j-proxy/fuzz/corpus/
+mcp-j-proxy/fuzz/artifacts/
+
