@@ -1,16 +1,14 @@
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
-use anyhow::{Result, Context};
-use libc::{c_int, c_long};
+use anyhow::Result;
+use libc::c_long;
 
 // openat2 constants - normally in linux/openat2.h or fcntl.h
 // If libc doesn't define them, we define them.
 const SYS_OPENAT2: c_long = 437; // x86_64
 const RESOLVE_BENEATH: u64 = 0x08;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-const RESOLVE_NO_SYMLINKS: u64 = 0x04;
-const RESOLVE_NO_XDEV: u64 = 0x01;
 
 #[repr(C)]
 #[derive(Debug, Default)]

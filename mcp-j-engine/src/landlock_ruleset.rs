@@ -3,7 +3,7 @@ use landlock::{
     PathBeneath
 };
 use std::collections::HashMap;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use std::path::PathBuf;
 use enumflags2::BitFlags;
 

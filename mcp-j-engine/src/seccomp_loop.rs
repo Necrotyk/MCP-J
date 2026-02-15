@@ -1,6 +1,6 @@
-use anyhow::{Result, Context};
+use anyhow::{Result};
 use std::os::unix::io::{RawFd, AsRawFd};
-use libc::{c_int, ioctl, pid_t};
+use libc::{pid_t};
 use crate::seccomp_sys::{
     seccomp_notif, seccomp_notif_resp,
     SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND, 
@@ -14,17 +14,33 @@ use std::path::PathBuf;
 
 use crate::SandboxManifest;
 
+use std::collections::HashSet;
+
 #[derive(Clone)]
 pub struct SeccompLoop {
     notify_fd: RawFd,
     project_root: PathBuf,
     allowed_command: PathBuf,
     manifest: SandboxManifest,
+    allowed_ips: HashSet<u32>,
 }
 
 impl SeccompLoop {
     pub fn new(notify_fd: RawFd, project_root: PathBuf, allowed_command: PathBuf, manifest: SandboxManifest) -> Self {
-        Self { notify_fd, project_root, allowed_command, manifest }
+        // Pre-parse allowed IPs into u32 (network byte order)
+        let mut allowed_ips = HashSet::new();
+        // Always allow localhost
+        allowed_ips.insert(0x7F000001); // 127.0.0.1
+        
+        for ip_str in &manifest.allowed_egress_ips {
+            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                 allowed_ips.insert(u32::from(ip));
+            } else {
+                 tracing::warn!(ip = %ip_str, "Failed to parse allowed egress IP in manifest");
+            }
+        }
+    
+        Self { notify_fd, project_root, allowed_command, manifest, allowed_ips }
     }
 
     // Helper to read memory from the tracee
@@ -203,7 +219,7 @@ impl SeccompLoop {
         
         match sa_family as i32 {
             libc::AF_UNIX => {
-                 // Allow local unix sockets by default per logic, or check?
+                 // Allow local unix sockets by default per logic
                  // UNIX sockets are usually for IPC within namespaces if private.
                  Ok(self.resp_continue(req))
             },
@@ -225,19 +241,27 @@ impl SeccompLoop {
                      );
                  }
                  
-                 let ip_raw = u32::from_be(sin.sin_addr.s_addr);
-                 let ip_addr = std::net::Ipv4Addr::from(ip_raw);
-                 let ip_str = ip_addr.to_string();
+                 // sin.sin_addr.s_addr is already u32 in network byte order (big endian usually on network, but u32 in struct)
+                 // Rust's Ipv4Addr::from(u32) takes host byte order or network? 
+                 // Actually s_addr is just a u32. 
+                 // Ipv4Addr::from(u32) assumes host byte order if we want 1.2.3.4 to be 0x01020304?
+                 // Wait, u32::from(Ipv4Addr) returns host byte order.
+                 // s_addr is big endian (network byte order).
+                 // We should convert s_addr (BE) to native (host) u32 valid for Ipv4Addr or just compare directly.
+                 // It's safer to rely on Ipv4Addr parsing in consistent way.
+                 // let ip_raw = u32::from_be(sin.sin_addr.s_addr);
                  
-                 // Use manifest allowed_egress_ips
-                 // Note: manifest IPs are strings.
-                 // We convert to string and check or parse manifest IPs to u32?
-                 // String check is safer/easier for now.
+                 // The hashset stores u32::from(Ipv4Addr). Ipv4Addr "127.0.0.1" -> 0x7F000001 (Host Order).
+                 // sin.sin_addr.s_addr is Network Order (Big Endian).
+                 // So we need: u32::from_be(sin.sin_addr.s_addr) to match Host Order.
                  
-                 if self.manifest.allowed_egress_ips.contains(&ip_str) {
+                 let ip_host_order = u32::from_be(sin.sin_addr.s_addr);
+                 
+                 if self.allowed_ips.contains(&ip_host_order) {
                       Ok(self.resp_continue(req))
                  } else {
-                      tracing::warn!(pid = tracee_pid, dst_ip = %ip_str, "Blocked outbound connection to IPv4");
+                      let ip_addr = std::net::Ipv4Addr::from(ip_host_order);
+                      tracing::warn!(pid = tracee_pid, dst_ip = %ip_addr, "Blocked outbound connection to IPv4");
                       Ok(self.resp_error(req, libc::EACCES))
                  }
             },
@@ -370,7 +394,7 @@ impl SeccompLoop {
         };
 
         // 3. Perform safe open
-        let flags = req.data.args[2] as u64; // openat(dirfd, path, flags, mode)
+        let flags = req.data.args[2]; // openat(dirfd, path, flags, mode)
         let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_str, flags) {
             Ok(f) => f,
             Err(e) => {
@@ -413,7 +437,7 @@ impl SeccompLoop {
     // Handling legacy open syscall: open(path, flags, mode)
     fn handle_open_legacy(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
          let ptr = req.data.args[0];
-         let flags = req.data.args[1] as u64;
+         let flags = req.data.args[1];
          
          let tracee_pid = req.pid as pid_t;
          let path_str = match self.read_string_tracee(tracee_pid, ptr) {

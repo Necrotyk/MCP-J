@@ -19,6 +19,12 @@ struct ToolCallParams {
     arguments: Option<Value>,
 }
 
+impl Default for JsonRpcProxy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JsonRpcProxy {
     pub fn new() -> Self {
         Self

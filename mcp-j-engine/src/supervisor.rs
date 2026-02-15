@@ -92,6 +92,7 @@ impl Supervisor {
                     pid: child,
                     stdin: Some(stdin_file),
                     stdout: Some(stdout_file),
+                    cgroup_guard: Some(CgroupGuard::new(child.as_raw() as u32)),
                 })
             }
             Ok(ForkResult::Child) => {
@@ -161,13 +162,16 @@ impl Supervisor {
 
     fn setup_child(&self, sock: RawFd) -> Result<()> {
         // --- PHASE 0: Cgroup v2 Resource Bounding ---
+        // --- PHASE 0: Cgroup v2 Resource Bounding ---
         let pid = std::process::id();
-        let cgroup_path = PathBuf::from(format!("/sys/fs/cgroup/mcp-j-{}", pid));
+        let cgroup_guard = CgroupGuard::new(pid);
+        let cgroup_path = cgroup_guard.path().clone();
         
         // Attempt to create cgroup and limit resource
-        // We do this before unsharing/pivoting so we see host /sys/fs/cgroup
         if let Err(e) = std::fs::create_dir(&cgroup_path) {
              tracing::warn!(path = ?cgroup_path, error = %e, "Failed to create cgroup. Resource limits might not be applied.");
+             // If failed to create, maybe return error or proceed without cgroup?
+             // Proceed for now, but guard won't remove anything if it wasn't created theoretically (rmdir fails).
         } else {
              // Add self to cgroup
              if let Err(e) = std::fs::write(cgroup_path.join("cgroup.procs"), pid.to_string()) {
@@ -358,14 +362,50 @@ impl Supervisor {
     }
 }
 
+// Helper for Cgroup RAII cleanup
+pub struct CgroupGuard {
+    path: PathBuf,
+}
+
+impl CgroupGuard {
+    pub fn new(pid: u32) -> Self {
+        let path = PathBuf::from(format!("/sys/fs/cgroup/mcp-j-{}", pid));
+        Self { path }
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        // Attempt to remove cgroup
+        // It might be busy if child is still running, but we try best effort.
+        // Or if we moved child out? (we don't move child out usually).
+        // Usually wait() happens before drop.
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+
 pub struct JailedChild {
     pub pid: nix::unistd::Pid,
     pub stdin: Option<std::fs::File>,
     pub stdout: Option<std::fs::File>,
+    pub cgroup_guard: Option<CgroupGuard>, // Moved here, or keep in Supervisor context? 
+    // Wait, the child is in the cgroup. We can only remove cgroup after all processes in it are gone.
+    // So JailedChild should own the guard, and on Drop (after wait), it cleans up.
 }
 
 impl JailedChild {
     pub fn wait(&mut self) -> Result<WaitStatus> {
-        waitpid(self.pid, None).map_err(|e| anyhow::anyhow!("waitpid failed: {}", e))
+        let res = waitpid(self.pid, None).map_err(|e| anyhow::anyhow!("waitpid failed: {}", e));
+        
+        // After wait returns, the child is dead (zombie harvested).
+        // Cgroup should be empty (unless other processes spawned in it?).
+        // It's safe to assume we can try to remove it now?
+        // But JailedChild::drop will handle it strictly via CgroupGuard.
+        res
     }
 }

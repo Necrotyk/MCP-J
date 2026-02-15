@@ -1,7 +1,7 @@
 use clap::Parser;
 use mcp_j_engine::supervisor::Supervisor;
 use mcp_j_engine::SandboxManifest;
-use anyhow::{Context, Result};
+use anyhow::{Context};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize structured logging
     tracing_subscriber::fmt()
         .json()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
         .init();
@@ -154,8 +155,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for child exit
     let wait_task = tokio::task::spawn_blocking(move || {
-        let status = child.wait();
-        status
+        child.wait()
     });
     
     // Race tasks

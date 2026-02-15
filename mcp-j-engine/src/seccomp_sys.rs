@@ -1,4 +1,4 @@
-use libc::{c_int, c_long, c_ulong, c_void};
+use libc::{c_int, c_long, c_ulong};
 use std::mem;
 
 // Seccomp constants

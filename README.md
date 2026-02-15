@@ -25,6 +25,7 @@ MCP-J is a hardened, secure runtime environment for executing untrusted [Model C
 - **Memory Safety**: Enforces a strict **5MB** payload limit on JSON-RPC messages to prevent heap exhaustion.
 - **Protocol Compliance**: A fully JSON-RPC 2.0 compliant proxy validates and sanitizes all messages between the host and method.
 - **Error Handling**: Gracefully handles protocol violations with structured error responses, ensuring IDE stability.
+- **IDE Compatibility**: All structured telemetry and logs are emitted to `stderr`, preserving the `stdout` channel exclusively for JSON-RPC messages.
 
 ## Project Structure
 
