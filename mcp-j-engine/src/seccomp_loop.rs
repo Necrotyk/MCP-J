@@ -289,6 +289,12 @@ impl SeccompLoop {
             }
         };
 
+        // Phase 30: Lexical Path Traversal Eradication
+        if path_bytes.windows(2).any(|w| w == b"..") {
+            tracing::warn!(pid = tracee_pid, "Blocked execve with directory traversal payload ('..')");
+            return Ok(self.resp_error(req, libc::EACCES));
+        }
+
         // Check against readonly mounts prefixes (byte comparison)
         let is_allowed = self.manifest.readonly_mounts.iter().any(|prefix| {
             let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();

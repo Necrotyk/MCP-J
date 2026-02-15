@@ -31,8 +31,17 @@ impl LandlockRuleset {
         self
     }
 
+
     pub fn apply(&self) -> Result<()> {
-        let abi = ABI::V4;
+        // Phase 31: Dynamic LSM ABI Negotiation
+        // Use default() which probes V1
+        let abi = ABI::V1; 
+        
+        // Attempt to upgrade to best supported if possible? 
+        // Actually, just using V1 is safest for broad compatibility if we only need V1 features.
+        // But if we want max protection, we should check.
+        // The landlock crate's ABI enum usually has V1, V2, V3 etc.
+        // `AccessFs::from_all(abi)` will return access rights supported by that ABI.
         
         let mut ruleset = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))?

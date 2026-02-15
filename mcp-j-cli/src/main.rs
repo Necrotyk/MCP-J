@@ -71,6 +71,21 @@ async fn main() -> anyhow::Result<()> {
     
     let host_stdin = tokio::io::stdin();
 
+    // Helper to broadcast termination
+    async fn send_termination_notification(reason: &str) {
+        let teardown_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "mcp/server_terminated",
+            "params": { "reason": reason }
+        });
+        if let Ok(serialized) = serde_json::to_string(&teardown_msg) {
+            let payload = format!("Content-Length: {}\r\n\r\n{}", serialized.len(), serialized);
+            let mut stdout = tokio::io::stdout();
+            let _ = stdout.write_all(payload.as_bytes()).await;
+            let _ = stdout.flush().await;
+        }
+    }
+
     async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
         let mut content_length = None;
         loop {
@@ -259,10 +274,12 @@ async fn main() -> anyhow::Result<()> {
         },
         _ = sigint.recv() => {
             tracing::warn!("SIGINT trapped. Executing strict teardown sequence.");
+            send_termination_notification("host_signal_sigint").await;
             let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), nix::sys::signal::Signal::SIGKILL);
         },
         _ = sigterm.recv() => {
             tracing::warn!("SIGTERM trapped. Executing strict teardown sequence.");
+            send_termination_notification("host_signal_sigterm").await;
             let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), nix::sys::signal::Signal::SIGKILL);
         }
     }

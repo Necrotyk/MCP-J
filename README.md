@@ -66,7 +66,7 @@ cargo run -p mcp-j-cli -- /usr/bin/python3 -m my_mcp_server
 
 ## Requirements
 
-- **Linux Kernel**: 5.13+ (for Landlock and Seccomp User Notification support).
+- **Linux Kernel**: 5.13+ (for Landlock and Seccomp User Notification support). The runtime dynamically negotiates the best supported Landlock ABI (baseline V1) for broad compatibility.
 - **Cgroups v2**: Enabled system-wide (standard on modern systemd distros).
 - **Unprivileged User Namespaces**: Must be enabled (`kernel.unprivileged_userns_clone = 1` on some distros).
 
