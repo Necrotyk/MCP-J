@@ -2,141 +2,64 @@
 
 MCP-J is a hardened, secure runtime environment for executing untrusted [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) agents. It leverages modern Linux kernel isolation primitives to enforce strict boundaries between the agent and the host system, mitigating risks associated with executing potentially diverse AI-generated code or tools.
 
-## Key Features
+## 🚀 Key Features
 
-### 🛡️ Deep System Isolation
-- **Filesystem Jail**: Uses `pivot_root` to completely detatch the agent from the host filesystem. The agent sees a constructed root with minimal necessary mounts (`/bin`, `/lib`, `/usr`, `/proc`).
-- **Landlock LSM**: Adds a second layer of defense by restricting file access within the jail to a default-deny policy.
-- **Namespace Isolation**: Runs agents in isolated namespaces (PID, Mount, IPC, UTS, Net, User) to prevent process visibility and unauthorized IPC.
+- **Deep Isolation**: Filesystem Jail (`pivot_root`), Landlock LSM, and Namespace Isolation (PID, Net, IPC, User).
+- **Kernel Hardening**: Seccomp Syscall Interception (`connect`, `execve`, `openat`) in user space.
+- **Network Control**: Default-deny network policy with strict allowlisting.
+- **Resource Limits**: Cgroups v2 for memory and CPU quotas.
+- **Secure IPC**: Strict JSON-RPC 2.0 proxy with message framing and validation.
+- **Structured Logs**: High-fidelity JSON logs for SIEM integration.
 
-### 🔐 Kernel-Level Hardening
-- **Seccomp Syscall Interception**: Uses `SECCOMP_RET_USER_NOTIF` to intercept critical system calls (`openat`, `connect`, `execve`, `bind`) in user space.
-- **TOCTOU Mitigation**: Secure file descriptor handling using `pidfd_open` and `pidfd_getfd` to prevent race conditions.
-- **Strict Execve Control**: Implementation of `handle_execve` ensures only approved binaries within read-only, root-owned mount points can be executed.
-- **Privilege Dropping**: The agent process drops all capabilities (`PR_CAPBSET_DROP`) and permanently switches to the unprivileged `nobody` user (UID 65534).
-- **Cgroup Process Annihilation**: The `CgroupGuard` RAII struct ensures absolute cleanup by inspecting `cgroup.procs` and issuing `SIGKILL` to all lingering processes before removing the controller group, preventing resource leaks.
+## 📚 Documentation
 
-### 🌐 Network & Resource Control
-- **Default-Deny Network Policy**: Outbound network access is strictly blocked by default.
-    - **Allowlist**: Only `127.0.0.1` (localhost) and core DNS resolvers (`1.1.1.1`, `8.8.8.8`) are permitted for proxy/resolution communication.
-    - **Blocklist**: All other IPv4/IPv6 traffic is denied, explicitly blocking cloud metadata services (e.g., AWS `169.254.169.254`).
-    - **UDP/TCP Equality**: The Seccomp filter intercepts both connected (`connect`) and connectionless (`sendto`, `sendmsg`) socket operations, preventing UDP data exfiltration and DNS tunneling bypasses.
-- **Resource Constraints**: Cgroups v2 integration limits the agent to **512MB** of memory to prevent Denial-of-Service (DoS) via resource exhaustion.
+- [**Installation Guide**](docs/INSTALL.md) - How to install the CLI and VSCode extension.
+- [**Configuration Guide**](docs/CONFIGURATION.md) - Manifest schema, environment variables, and logging.
+- [**Architecture Overview**](docs/ARCHITECTURE.md) - Deep dive into supervisor, jail, and seccomp internals.
+- [**Troubleshooting**](docs/TROUBLESHOOTING.md) - Common errors and solutions.
+- [**Contributing**](CONTRIBUTING.md) - Development setup and guidelines.
 
-### ⚡ Secure IPC Proxy
-- **Strict MCP/LSP Transport**: Fully compliant with the standard Model Context Protocol transport specification, enforcing `Content-Length` headers and `\r\n\r\n` delimiters for deterministic message framing.
-- **Memory Safety**: Enforces a strict **5MB** payload limit on JSON-RPC messages to prevent heap exhaustion. Any message exceeding this limit results in immediate connection termination.
-- **Protocol Compliance**: A fully JSON-RPC 2.0 compliant proxy validates and sanitizes all messages between the host and method.
-- **Byte-Safe Path Handling**: Internal logic uses raw byte paths (`Vec<u8>`) to correctly handle non-UTF8 filenames on Linux, preventing panics and access control bypasses.
-- **Error Handling**: Gracefully handles protocol violations with structured error responses, ensuring IDE stability.
-- **IDE Compatibility**: All structured telemetry and logs are emitted to `stderr`, preserving the `stdout` channel exclusively for JSON-RPC messages.
+## ⚡ Quick Start
 
-## Project Structure
-
-- **`mcp-j-engine`**: The core library implementing the sandboxing logic, seccomp notification loop, supervisor state machine, and Landlock rules.
-- **`mcp-j-cli`**: The command-line entry point. It launches the supervisor, spawns the jailed process, and manages the secure IPC proxy.
-- **`mcp-j-proxy`**: A strict JSON-RPC 2.0 proxy library that validates, parses, and sanitizes messages, enforcing security policies on tool calls.
-
-## Architecture
-
-1.  **Supervisor**: The `mcp-j-cli` starts the `Supervisor`, which sets up Cgroups and prepares the environment.
-2.  **Jail Setup**:
-    -   **Namespaces**: The process unshares User, Mount, PID, IPC, UTS, and Net namespaces.
-    -   **Root Pivot**: A temporary root is created in `/tmp`, essential system directories are bind-mounted read-only, and `pivot_root` is executed.
-    -   **Proc Mount**: A fresh `/proc` is mounted within the jail.
-    -   **Privilege Drop**: Capabilities are dropped, and the process switches to UID `nobody`.
-3.  **Seccomp Filter**: A BPF filter is installed to trap sensitive syscalls (`connect`, `execve`, `openat`).
-4.  **Execution**: The supervisor intercepts syscalls via the Seccomp Notify user-space API.
-    -   **Network**: Connect attempts are validated against the allowlist.
-    -   **Filesystem**: Open attempts are checked against Landlock rules and path allowlists.
-    -   **Execution**: Execve attempts are verified to ensure only safe binaries are run.
-
-## Usage
-
-To run a command inside the secure jail:
-
+### Run a Sanboxed Command
 ```bash
-cargo run -p mcp-j-cli -- /path/to/mcp-server-binary [args]
+# Run python3 inside the jail with default settings
+mcp-j-cli -- /usr/bin/python3 -c "print('Hello from the sandbox!')"
 ```
 
-Example:
-
+### With Configuration
 ```bash
-cargo run -p mcp-j-cli -- /usr/bin/python3 -m my_mcp_server
+# Use a manifest for custom net/fs policies
+mcp-j-cli --manifest config.json -- /usr/bin/node app.js
 ```
 
-## Requirements
+## 🧩 VSCode Extension
 
-- **Linux Kernel**: 5.13+ (for Landlock and Seccomp User Notification support). The runtime dynamically negotiates the best supported Landlock ABI (baseline V1) for broad compatibility.
-- **Cgroups v2**: Enabled system-wide (standard on modern systemd distros).
-- **Unprivileged User Namespaces**: Must be enabled (`kernel.unprivileged_userns_clone = 1` on some distros).
+The official VSCode extension provides a seamless integration with the MCP-J runtime.
+
+- **Marketplace**: (Coming Soon)
+- **Manual Install**: Download `.vsix` from [Releases](https://github.com/Necrotyk/MCP-J/releases).
+- [**Client Documentation**](clients/vscode-mcp-j/README.md)
+
+## 🛠️ Project Structure
+
+- **`mcp-j-engine`**: Core library sandboxing logic (namespaces, landlock, seccomp).
+- **`mcp-j-cli`**: Command-line supervisor and IPC proxy manager.
+- **`mcp-j-proxy`**: JSON-RPC message validation and framing.
+- **`clients/vscode-mcp-j`**: Visual Studio Code extension.
+
+## ⚠️ Requirements
+
+- **Linux Kernel 5.13+**: For Landlock and Seccomp User Notification support.
+- **Unprivileged User Namespaces**: `kernel.unprivileged_userns_clone = 1`.
+- **Cgroups v2**: Enabled system-wide.
 
 ## Security Status
 
 **Current Status**: 🛡️ **Hardened Beta** 🛡️
 
-This project has undergone significant security hardening, including memory safety bounds, privilege dropping, and network egress filtering. However, as with any security-critical software, it should be reviewed and tested in your specific environment before deployment in high-assurance contexts.
+This project has undergone significant security hardening. However, it should be reviewed and tested in your specific environment before deployment in high-assurance contexts.
 
 ## License
 
 MIT / Apache-2.0
-
-### 📊 Structured Telemetry
-
-The runtime now emits high-fidelity, structured JSON logs via `tracing`. This allows for programmatic monitoring and SIEM integration.
-
-Each log entry is a JSON object containing:
-- `timestamp`: ISO 8601 timestamp.
-- `level`: Log level (INFO, WARN, ERROR).
-- `message`: Human-readable event description.
-- `target`: The Rust module source.
-- Contextual fields: `pid`, `path`, `dst_ip`, `error`, etc.
-
-**Example Blocked Connection:**
-```json
-{
-  "timestamp": "2024-02-14T21:00:00.000Z",
-  "level": "WARN",
-  "message": "Blocked outbound connection to IPv4",
-  "target": "mcp_j_engine::seccomp_loop",
-  "pid": 1234,
-  "dst_ip": "192.168.1.1"
-}
-```
-
-### 📜 Declarative Execution Manifests
-
-You can now configure the sandbox environment using a JSON manifest file via the `--manifest` flag.
-
-**Usage:**
-```bash
-cargo run -p mcp-j-cli -- --manifest sandbox_config.json /usr/bin/python3 app.py
-```
-
-**Schema (`sandbox_config.json`):**
-```json
-{
-  "max_memory_mb": 1024,
-  "allowed_egress_ips": [
-    "127.0.0.1",
-    "10.0.0.5"
-  ],
-  "readonly_mounts": [
-    "/bin",
-    "/usr/bin",
-    "/lib",
-    "/lib64",
-    "/usr/lib",
-    "/opt/my-libs"
-  ],
-  "env_vars": {
-    "RUST_LOG": "info",
-    "MY_API_KEY": "secret"
-  },
-  "max_cpu_quota_pct": 50
-}
-```
-If no manifest is provided, secure defaults (512MB RAM, 100% CPU quota (1 core), localhost-only network, standard system paths) are used.
-
-### 📝 Stderr Multiplexing
-Standard error from the jailed process is now captured and wrapped in structured JSON logs with `source="tracee_stderr"`. This prevents unstructured text from corrupting the parent IDE's JSON parser while preserving full observability of agent crashes or errors.
