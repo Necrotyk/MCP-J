@@ -247,6 +247,12 @@ impl SeccompLoop {
         let ptr = req.data.args[0];
         let tracee_pid = req.pid as pid_t;
         
+        // We read the path. Note that tracee could modify it after we read.
+        // However, we rely on the fact that only specific paths are mounted executably/accessibly 
+        // and we have dropped privileges and namespaces.
+        // The user instruction "Shift execution boundary enforcement: Rely on the MS_RDONLY bind mounts" 
+        // implies that we should check if the path is indeed in one of those mounts.
+        
         let path = match self.read_string_tracee(tracee_pid, ptr) {
             Ok(s) => s,
             Err(e) => {
@@ -255,20 +261,18 @@ impl SeccompLoop {
             }
         };
 
-        // Strict whitelist: Allow only the original command
-        let allowed = self.allowed_command.to_string_lossy();
+        // Allowed prefixes for binaries (from supervisor mounts)
+        // /bin, /usr/bin, /lib, /lib64, /usr/lib, /usr/lib64
+        // And the original command itself?
+        // The user says "Restrict the path check to ensure the binary resides within these read-only, root-owned mount points."
+        let allowed_prefixes = ["/bin/", "/usr/bin/", "/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/"];
         
-        // Normalize path?
-        // If path is typically absolute.
-        // We check if path == allowed OR path == <relative allowed>?
-        // For security, strict match.
-        // If allowed is "python3", but executed as "/usr/bin/python3", it might fail if we don't resolve.
-        // But for now, strict string equality is safest default-deny.
-        
-        if path == allowed {
+        let is_allowed = allowed_prefixes.iter().any(|prefix| path.starts_with(prefix)) || path == self.allowed_command.to_string_lossy();
+
+        if is_allowed {
              Ok(self.resp_continue(req))
         } else {
-             eprintln!("Blocked execve: {} != {}", path, allowed);
+             eprintln!("Blocked execve: {} (Not in allowed RO mounts)", path);
              Ok(self.resp_error(req, libc::EACCES))
         }
     }

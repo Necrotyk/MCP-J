@@ -246,6 +246,20 @@ impl Supervisor {
              None::<&str>
         ).context("Failed to bind mount jail root to itself")?;
         
+        // Create and mount /proc
+        let proc_path = jail_root.join("proc");
+        if !proc_path.exists() {
+             std::fs::create_dir(&proc_path).context("Failed to create /proc in jail")?;
+        }
+        
+        mount(
+            Some("proc"),
+            &proc_path,
+            Some("proc"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        ).context("Failed to mount /proc")?;
+
         nix::unistd::pivot_root(jail_root, &old_root).context("Failed to pivot root")?;
         
         unistd::chdir("/").context("Failed to chdir to new root")?;
@@ -256,10 +270,18 @@ impl Supervisor {
         
         unistd::chdir("/workspace").context("Failed to chdir to workspace")?;
 
-        // --- PHASE 2: Capability Dropping ---
+        // --- PHASE 2: Capability Dropping & UID Downgrade ---
         for cap in 0..=63 {
              unsafe {
                  libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+             }
+        }
+        
+        // Permanently surrender root privileges within the namespace
+        // setresuid(65534, 65534, 65534) (nobody)
+        unsafe {
+             if libc::setresuid(65534, 65534, 65534) != 0 {
+                  return Err(anyhow::anyhow!("Failed to setresuid to nobody: {}", std::io::Error::last_os_error()));
              }
         }
         
