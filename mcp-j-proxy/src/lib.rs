@@ -48,18 +48,12 @@ impl JsonRpcProxy {
         }
 
         // 1. Strict JSON-RPC 2.0 Parsing
-        // We parse into Value first to extract ID even if partial structs fail.
         let raw: Value = match serde_json::from_str(message) {
              Ok(v) => v,
              Err(e) => {
-                 // Parse error. Standard JSON-RPC 2.0 error for Parse Error is code -32700.
-                 // ID is null if parse failed.
                  let err = serde_json::json!({
                      "jsonrpc": "2.0",
-                     "error": {
-                         "code": -32700,
-                         "message": format!("Parse error: {}", e)
-                     },
+                     "error": { "code": -32700, "message": format!("Parse error: {}", e) },
                      "id": null
                  });
                  return Err(err);
@@ -69,69 +63,107 @@ impl JsonRpcProxy {
         // Extract ID for error reporting
         let id = raw.get("id").cloned().unwrap_or(Value::Null);
 
-        // Map to structured request for validation
-        let request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = serde_json::json!({
+        // Check if it's a Request (has method) or Response (has result/error)
+        if raw.get("method").is_some() {
+            // Handle Request
+            let request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32600, "message": format!("Invalid Request: {}", e) },
+                        "id": id
+                    });
+                    return Err(err);
+                }
+            };
+
+            // Protocol Enforcement
+            if request.jsonrpc != "2.0" {
+                return Err(serde_json::json!({
                     "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32600,
-                        "message": format!("Invalid Request: {}", e)
-                    },
+                    "error": { "code": -32600, "message": "Invalid JSON-RPC version" },
                     "id": id
-                });
-                return Err(err);
+                }));
             }
-        };
 
-        // 2. Protocol Enforcement
-        if request.jsonrpc != "2.0" {
-            let err = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32600,
-                    "message": "Invalid JSON-RPC version"
-                },
-                "id": id
-            });
-            return Err(err);
+            // Method Validation
+            let validation_result = match request.method.as_str() {
+                "tools/call" => {
+                    if let Some(params) = &request.params {
+                        self.validate_tool_call(params)
+                    } else {
+                        Ok(())
+                    }
+                }
+                "mcp-remote/authorize" | "mcp-remote/token" => {
+                    Err("Blocked restricted method: mcp-remote/*".to_string())
+                }
+                _ => Ok(())
+            };
+
+            if let Err(msg) = validation_result {
+                 let code = if msg.contains("Tool execution blocked") { -32601 } else { -32600 };
+                 let err = serde_json::json!({
+                     "jsonrpc": "2.0",
+                     "error": {
+                         "code": code,
+                         "message": format!("MCP-J SECCOMP: {}", msg)
+                     },
+                     "id": id
+                 });
+                 return Err(err);
+            }
+            
+            Ok(serde_json::to_value(request).unwrap())
+
+        } else {
+            // Handle Response (Potential Prompt Injection)
+            // Phase 68: Prompt Injection Sanitization (Egress Filter)
+            // We need to inspect 'result' for LLM control tokens.
+            if let Some(result) = raw.get("result") {
+                 let mut safe_result = result.clone();
+                 if self.recursive_sanitize(&mut safe_result) {
+                     // If sanitization occurred, synthesize a new response
+                     let mut new_raw = raw.clone();
+                     new_raw["result"] = safe_result;
+                     return Ok(new_raw);
+                 }
+            }
+            Ok(raw)
         }
+    }
 
-        // 3. Method-Specific Validation
-        let validation_result = match request.method.as_str() {
-            "tools/call" => {
-                if let Some(params) = &request.params {
-                    self.validate_tool_call(params)
-                } else {
-                    Ok(())
+    fn recursive_sanitize(&self, val: &mut Value) -> bool {
+        let mut modified = false;
+        match val {
+            Value::String(s) => {
+                let targets = ["<|im_start|>", "[INST]", "\nSystem:"];
+                for target in targets {
+                    if s.contains(target) {
+                        // Sanitization: Replace <| with &lt;| to break the token
+                        *s = s.replace("<|", "&lt;|")
+                              .replace("[INST]", "[SANITIZED_INST]")
+                              .replace("\nSystem:", "\n[SANITIZED_SYS]:");
+                        
+                        eprintln!("[PROMPT_INJECTION_ATTEMPT] Detected and neutralized LLM control token: {}", target);
+                        modified = true;
+                    }
                 }
             }
-            "mcp-remote/authorize" | "mcp-remote/token" => {
-                Err("Blocked restricted method: mcp-remote/*".to_string())
+            Value::Array(arr) => {
+                for item in arr {
+                    if self.recursive_sanitize(item) { modified = true; }
+                }
             }
-            _ => {
-                Ok(())
+            Value::Object(map) => {
+                for (_, value) in map {
+                    if self.recursive_sanitize(value) { modified = true; }
+                }
             }
-        };
-
-        if let Err(msg) = validation_result {
-             let code = if msg.contains("Tool execution blocked") { -32601 } else { -32600 };
-             let err = serde_json::json!({
-                 "jsonrpc": "2.0",
-                 "error": {
-                     "code": code,
-                     "message": format!("Security policy violation: {}", msg)
-                 },
-                 "id": id
-             });
-             return Err(err);
+            _ => {}
         }
-
-        // Return the parsed value
-        // We return the original raw value re-serialized (or just the struct)
-        // Returning request struct as Value
-        Ok(serde_json::to_value(request).unwrap())
+        modified
     }
 
     fn validate_tool_call(&self, params: &Value) -> Result<(), String> {
@@ -141,7 +173,7 @@ impl JsonRpcProxy {
         // Phase 67: Protocol-Aware Tool Filtering
         if let Some(allowed) = &self.allowed_tools {
             if !allowed.contains(&tool_params.name) {
-                return Err(format!("Tool execution blocked by policy: '{}'", tool_params.name));
+                return Err(format!("Tool execution blocked by Layer 7 policy: '{}'", tool_params.name));
             }
         }
 

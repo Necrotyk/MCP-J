@@ -10,6 +10,9 @@ let childProcess: cp.ChildProcess | undefined;
 let pendingManifest: string | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
+    // Phase 66: IDE Transport Hijacking
+    await hijackMcpConfiguration();
+
     // Phase 50: Integrated Security Terminal
     securityProvider = new SecurityPanelProvider(context.extensionUri);
     context.subscriptions.push(
@@ -334,6 +337,59 @@ function detectThreats(log: any) {
                     vscode.commands.executeCommand('mcp-j-security.focus');
                 }
             });
+    }
+}
+
+// Phase 66: IDE Transport Hijacking
+// Scans for .vscode/mcp.json and rewrites raw server commands to tunnel through mcp-j-cli
+async function hijackMcpConfiguration() {
+    if (!vscode.workspace.workspaceFolders) return;
+    const root = vscode.workspace.workspaceFolders[0].uri;
+    const mcpConfigUri = vscode.Uri.joinPath(root, '.vscode', 'mcp.json');
+
+    try {
+        const doc = await vscode.workspace.fs.readFile(mcpConfigUri);
+        const config = JSON.parse(doc.toString());
+        let modified = false;
+
+        if (config.mcpServers) {
+            for (const serverName in config.mcpServers) {
+                const server = config.mcpServers[serverName];
+                // Check if command is not mcp-j-cli (and isn't our own cli already)
+                if (server.command && !server.command.includes('mcp-j-cli')) {
+                    // Hijack this server
+                    const originalCmd = server.command;
+                    const originalArgs = server.args || [];
+
+                    // We rewrite to use mcp-j-cli
+                    // We assume mcp-j-cli is in the PATH or use a known location.
+                    // For portability in this environment, we'll assume 'mcp-j-cli'.
+                    server.command = "mcp-j-cli";
+
+                    // Prepend manifest and original command
+                    // We point to a profile specific to this server if possible, or generic. 
+                    // Prompt says "passing the appropriate workspace generic.json profile".
+                    server.args = [
+                        "--manifest",
+                        ".mcp-j/profiles/generic.json",
+                        originalCmd,
+                        ...originalArgs
+                    ];
+
+                    modified = true;
+                    outputChannel.appendLine(`[Hijack] Rewrote MCP server '${serverName}' to use mcp-j-cli.`);
+                }
+            }
+        }
+
+        if (modified) {
+            // Write back formatted JSON
+            await vscode.workspace.fs.writeFile(mcpConfigUri, Buffer.from(JSON.stringify(config, null, 4)));
+            vscode.window.showInformationMessage("MCP-J: Hijacked and hardened MCP server configurations.");
+        }
+    } catch (e) {
+        // Ignore if file doesn't exist or parse fails
+        // This is expected if no mcp.json exists
     }
 }
 
