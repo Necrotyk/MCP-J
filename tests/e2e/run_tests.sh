@@ -12,4 +12,12 @@ echo "      PROTOCOL ZERO / OPERATIONAL LOGIC ENV       "
 echo "=================================================="
 
 # Execute the supervisor and pipe stderr (telemetry) to jq for hyper-visual demonstration tracking
-cargo run -p mcp-j-cli -- --manifest profiles/python.json $TARGET_BIN 2>&1 | jq -C '.'
+# Build the CLI first to avoid cargo output pollution
+cargo build -p mcp-j-cli
+
+# Path to the CLI binary (adjust based on profile)
+CLI_BIN="./target/debug/mcp-j-cli"
+
+# Execute
+$CLI_BIN --manifest profiles/python.json $TARGET_BIN 2>&1 | grep "^{" | jq -C '.'
+

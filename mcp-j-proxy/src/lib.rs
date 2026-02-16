@@ -154,8 +154,15 @@ impl JsonRpcProxy {
         // with legitimate code artifacts (e.g. bash scripts, markdown).
         
         match args {
-            Value::String(_) => {
-                // No-op: Allow all strings.
+            Value::String(s) => {
+                // Phase 4: CVE-2025-6514 Shell Metacharacter Scrubbing
+                // Reject sequences: $(, `, |, ;, &&, ||, >
+                let forbidden = ["$(", "`", "|", ";", "&&", "||", ">"];
+                for pattern in forbidden {
+                    if s.contains(pattern) {
+                         return Err(format!("Security policy violation: Argument contains forbidden shell metacharacter sequence '{}'", pattern));
+                    }
+                }
             }
             Value::Array(arr) => {
                 for item in arr {

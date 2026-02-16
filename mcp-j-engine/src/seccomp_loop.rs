@@ -123,7 +123,7 @@ impl SeccompLoop {
             let mut req: seccomp_notif = unsafe { std::mem::zeroed() };
             
             // ioctl call
-            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_RECV as libc::c_ulong, &mut req) };
+            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_RECV as i32, &mut req) };
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -139,7 +139,7 @@ impl SeccompLoop {
             let resp = self.handle_request(&req)?;
 
             // Send response
-            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND as libc::c_ulong, &resp) };
+            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND as i32, &resp) };
             if ret < 0 {
                  let err = std::io::Error::last_os_error();
                  // If process died between RECV and SEND, acceptable.
@@ -456,6 +456,12 @@ impl SeccompLoop {
              Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
         };
 
+        // Phase 30: Lexical Path Traversal Eradication
+        if path_bytes.windows(2).any(|w| w == b"..") {
+            tracing::warn!(pid = tracee_pid, "Blocked openat with directory traversal payload ('..')");
+            return Ok(self.resp_error(req, libc::EACCES));
+        }
+
         // Phase 20: Absolute Path Resolution Bypass (Library Loading)
         if path_bytes.starts_with(b"/") {
              use std::os::unix::ffi::OsStrExt;
@@ -465,6 +471,16 @@ impl SeccompLoop {
              });
              
              if is_allowed_system {
+                  // Phase 31: Strict Flag Masking for System Mounts
+                  // Reject O_WRONLY, O_RDWR, O_CREAT for system mounts
+                  let acc_mode = req.data.args[2] as i32 & libc::O_ACCMODE;
+                  let flags = req.data.args[2] as i32;
+                  
+                  if acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR || (flags & libc::O_CREAT) != 0 {
+                      tracing::warn!(pid = tracee_pid, flags = flags, "Blocked write/create flags on system mount");
+                      return Ok(self.resp_error(req, libc::EACCES));
+                  }
+                  
                   return Ok(self.resp_continue(req));
              }
         }
@@ -523,7 +539,7 @@ impl SeccompLoop {
             newfd_flags: 0,
         };
         
-        let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong, &mut addfd) };
+        let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD as i32, &mut addfd) };
         if ret < 0 {
              let err = std::io::Error::last_os_error();
              return Err(anyhow::anyhow!("ioctl ADDFD failed: {}", err));
@@ -548,6 +564,12 @@ impl SeccompLoop {
             }
          };
          
+        // Phase 30: Lexical Path Traversal Eradication
+        if path_bytes.windows(2).any(|w| w == b"..") {
+            tracing::warn!(pid = tracee_pid, "Blocked open(legacy) with directory traversal payload ('..')");
+            return Ok(self.resp_error(req, libc::EACCES));
+        }
+
         // Phase 20: Absolute Path Resolution Bypass (Library Loading)
         if path_bytes.starts_with(b"/") {
              use std::os::unix::ffi::OsStrExt;
@@ -557,6 +579,15 @@ impl SeccompLoop {
              });
              
              if is_allowed_system {
+                  // Phase 31: Strict Flag Masking for System Mounts
+                  let acc_mode = flags as i32 & libc::O_ACCMODE;
+                  let flags_i32 = flags as i32;
+                  
+                  if acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR || (flags_i32 & libc::O_CREAT) != 0 {
+                      tracing::warn!(pid = tracee_pid, flags = flags, "Blocked write/create flags on system mount");
+                      return Ok(self.resp_error(req, libc::EACCES));
+                  }
+
                   return Ok(self.resp_continue(req));
              }
         }
