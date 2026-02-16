@@ -115,7 +115,13 @@ impl JsonRpcProxy {
                  return Err(err);
             }
             
-            Ok(serde_json::to_value(request).unwrap())
+            serde_json::to_value(request).map_err(|e| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32603, "message": format!("Internal error during serialization: {}", e) },
+                    "id": id
+                })
+            })
 
         } else {
             // Handle Response (Potential Prompt Injection)
