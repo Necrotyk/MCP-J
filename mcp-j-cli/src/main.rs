@@ -173,7 +173,13 @@ async fn main() -> anyhow::Result<()> {
                     match proxy_in.validate_and_parse(msg_str) {
                         Ok(valid_req) => {
                              let mut child_stdin = stdin_writer_clone.lock().await;
-                             let serialized = serde_json::to_string(&valid_req).unwrap();
+                             let serialized = match serde_json::to_string(&valid_req) {
+                                 Ok(s) => s,
+                                 Err(e) => {
+                                     tracing::error!(error = %e, "Failed to serialize valid request");
+                                     continue;
+                                 }
+                             };
                              let len = serialized.len();
                              let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
                              
@@ -184,7 +190,13 @@ async fn main() -> anyhow::Result<()> {
                              let _ = child_stdin.flush().await;
                         }
                         Err(rpc_err) => {
-                             let serialized = serde_json::to_string(&rpc_err).unwrap();
+                             let serialized = match serde_json::to_string(&rpc_err) {
+                                 Ok(s) => s,
+                                 Err(e) => {
+                                     tracing::error!(error = %e, "Failed to serialize RPC error");
+                                     continue;
+                                 }
+                             };
                              let len = serialized.len();
                              let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
                              let mut stdout = tokio::io::stdout();
@@ -221,7 +233,13 @@ async fn main() -> anyhow::Result<()> {
 
                     match proxy_out.validate_and_parse(msg_str) {
                         Ok(valid_resp) => {
-                             let serialized = serde_json::to_string(&valid_resp).unwrap();
+                             let serialized = match serde_json::to_string(&valid_resp) {
+                                 Ok(s) => s,
+                                 Err(e) => {
+                                     tracing::error!(error = %e, "Failed to serialize valid response");
+                                     continue;
+                                 }
+                             };
                              let len = serialized.len();
                              let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
                              
