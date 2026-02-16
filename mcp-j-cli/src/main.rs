@@ -56,10 +56,13 @@ async fn main() -> anyhow::Result<()> {
         manifest.env_vars.insert("TERM".to_string(), "xterm-256color".to_string());
     }
 
+    // Extract allowed_tools before moving manifest into supervisor
+    let allowed_tools = manifest.allowed_tools.clone();
+
     let supervisor = Supervisor::new(binary, args, project_root, manifest)?;
     let mut child = supervisor.spawn()?;
 
-    let proxy = Arc::new(JsonRpcProxy::new());
+    let proxy = Arc::new(JsonRpcProxy::new(allowed_tools));
     
     let child_stdin = child.stdin.take().expect("Child stdin missing");
     let child_stdout = child.stdout.take().expect("Child stdout missing");

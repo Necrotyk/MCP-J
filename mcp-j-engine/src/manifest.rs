@@ -28,6 +28,9 @@ pub struct SandboxManifest {
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
 
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+
     #[serde(default = "default_max_cpu_quota_pct")]
     pub max_cpu_quota_pct: u32,
 
@@ -57,6 +60,10 @@ impl Default for SandboxManifest {
                 "/usr/bin".to_string()
             ],
             env_vars: HashMap::new(),
+            allowed_tools: Some(vec![
+                "read_file".to_string(),
+                "list_directory".to_string(),
+            ]),
             max_cpu_quota_pct: 100,
             mode: SecurityMode::Enforcing,
         }

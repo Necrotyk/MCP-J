@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone)]
-pub struct JsonRpcProxy;
+pub struct JsonRpcProxy {
+    allowed_tools: Option<Vec<String>>,
+}
 
 #[derive(Deserialize, Serialize, Debug)]
 #[allow(dead_code)]
@@ -21,13 +23,13 @@ struct ToolCallParams {
 
 impl Default for JsonRpcProxy {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl JsonRpcProxy {
-    pub fn new() -> Self {
-        Self
+    pub fn new(allowed_tools: Option<Vec<String>>) -> Self {
+        Self { allowed_tools }
     }
 
     pub fn validate_and_parse(&self, message: &str) -> Result<Value, Value> {
@@ -114,10 +116,11 @@ impl JsonRpcProxy {
         };
 
         if let Err(msg) = validation_result {
+             let code = if msg.contains("Tool execution blocked") { -32601 } else { -32600 };
              let err = serde_json::json!({
                  "jsonrpc": "2.0",
                  "error": {
-                     "code": -32600, // Invalid Request / Policy violation
+                     "code": code,
                      "message": format!("Security policy violation: {}", msg)
                  },
                  "id": id
@@ -134,6 +137,13 @@ impl JsonRpcProxy {
     fn validate_tool_call(&self, params: &Value) -> Result<(), String> {
         let tool_params: ToolCallParams = serde_json::from_value(params.clone())
             .map_err(|_| "Invalid params structure for tools/call".to_string())?;
+
+        // Phase 67: Protocol-Aware Tool Filtering
+        if let Some(allowed) = &self.allowed_tools {
+            if !allowed.contains(&tool_params.name) {
+                return Err(format!("Tool execution blocked by policy: '{}'", tool_params.name));
+            }
+        }
 
         if let Some(args) = tool_params.arguments {
             self.validate_arguments(&args, 0)?;
@@ -160,7 +170,7 @@ impl JsonRpcProxy {
                 let forbidden = ["$(", "`", "|", ";", "&&", "||", ">"];
                 for pattern in forbidden {
                     if s.contains(pattern) {
-                         return Err(format!("Security policy violation: Argument contains forbidden shell metacharacter sequence '{}'", pattern));
+                         return Err(format!("Argument contains forbidden shell metacharacter sequence '{}'", pattern));
                     }
                 }
             }
