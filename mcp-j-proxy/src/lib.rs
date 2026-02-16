@@ -15,12 +15,6 @@ struct JsonRpcRequest {
     id: Option<Value>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-struct ToolCallParams {
-    name: String,
-    arguments: Option<Value>,
-}
-
 impl Default for JsonRpcProxy {
     fn default() -> Self {
         Self::new(None)
@@ -176,18 +170,22 @@ impl JsonRpcProxy {
     }
 
     fn validate_tool_call(&self, params: &Value) -> Result<(), String> {
-        let tool_params: ToolCallParams = serde_json::from_value(params.clone())
-            .map_err(|_| "Invalid params structure for tools/call".to_string())?;
+        let params_obj = params.as_object()
+            .ok_or_else(|| "Invalid params structure for tools/call".to_string())?;
+
+        let name = params_obj.get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Invalid params structure for tools/call".to_string())?;
 
         // Phase 67: Protocol-Aware Tool Filtering
         if let Some(allowed) = &self.allowed_tools {
-            if !allowed.contains(&tool_params.name) {
-                return Err(format!("Tool execution blocked by Layer 7 policy: '{}'", tool_params.name));
+            if !allowed.iter().any(|s| s == name) {
+                return Err(format!("Tool execution blocked by Layer 7 policy: '{}'", name));
             }
         }
 
-        if let Some(args) = tool_params.arguments {
-            self.validate_arguments(&args, 0)?;
+        if let Some(args) = params_obj.get("arguments") {
+            self.validate_arguments(args, 0)?;
         }
         Ok(())
     }
