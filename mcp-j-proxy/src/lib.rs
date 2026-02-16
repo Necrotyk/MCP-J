@@ -15,12 +15,6 @@ struct JsonRpcRequest {
     id: Option<Value>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-struct ToolCallParams {
-    name: String,
-    arguments: Option<Value>,
-}
-
 impl Default for JsonRpcProxy {
     fn default() -> Self {
         Self::new(None)
@@ -176,18 +170,22 @@ impl JsonRpcProxy {
     }
 
     fn validate_tool_call(&self, params: &Value) -> Result<(), String> {
-        let tool_params: ToolCallParams = serde_json::from_value(params.clone())
-            .map_err(|_| "Invalid params structure for tools/call".to_string())?;
+        let params_obj = params.as_object()
+            .ok_or_else(|| "Invalid params structure for tools/call".to_string())?;
+
+        let name = params_obj.get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Invalid params structure for tools/call".to_string())?;
 
         // Phase 67: Protocol-Aware Tool Filtering
         if let Some(allowed) = &self.allowed_tools {
-            if !allowed.contains(&tool_params.name) {
-                return Err(format!("Tool execution blocked by Layer 7 policy: '{}'", tool_params.name));
+            if !allowed.iter().any(|s| s == name) {
+                return Err(format!("Tool execution blocked by Layer 7 policy: '{}'", name));
             }
         }
 
-        if let Some(args) = tool_params.arguments {
-            self.validate_arguments(&args, 0)?;
+        if let Some(args) = params_obj.get("arguments") {
+            self.validate_arguments(args, 0)?;
         }
         Ok(())
     }
@@ -208,7 +206,7 @@ impl JsonRpcProxy {
             Value::String(s) => {
                 // Phase 4: CVE-2025-6514 Shell Metacharacter Scrubbing
                 // Reject sequences: $(, `, |, ;, &&, ||, >
-                let forbidden = ["$(", "`", "|", ";", "&&", "||", ">"];
+                let forbidden = ["$(", "`", "||", "&&", "|", ";", ">"];
                 for pattern in forbidden {
                     if s.contains(pattern) {
                          return Err(format!("Argument contains forbidden shell metacharacter sequence '{}'", pattern));
@@ -231,3 +229,118 @@ impl JsonRpcProxy {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_request() {
+        let proxy = JsonRpcProxy::default();
+        let msg = r#"{"jsonrpc": "2.0", "method": "ping", "params": {}, "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_ok());
+        let val = res.unwrap();
+        assert_eq!(val["method"], "ping");
+    }
+
+    #[test]
+    fn test_valid_response() {
+        let proxy = JsonRpcProxy::default();
+        let msg = r#"{"jsonrpc": "2.0", "result": "pong", "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_ok());
+        let val = res.unwrap();
+        assert_eq!(val["result"], "pong");
+    }
+
+    #[test]
+    fn test_payload_overflow() {
+        let proxy = JsonRpcProxy::default();
+        // 10MB + 1 byte
+        let big_msg = "a".repeat(10 * 1024 * 1024 + 1);
+        let res = proxy.validate_and_parse(&big_msg);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err["error"]["code"], -32600);
+        assert!(err["error"]["message"].as_str().unwrap().contains("IPC_PAYLOAD_OVERFLOW"));
+    }
+
+    #[test]
+    fn test_invalid_json() {
+        let proxy = JsonRpcProxy::default();
+        let msg = r#"{"jsonrpc": "2.0", "method": "ping", "params": {}, "id": 1"#; // Missing closing brace
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err["error"]["code"], -32700);
+        assert!(err["error"]["message"].as_str().unwrap().contains("Parse error"));
+    }
+
+    #[test]
+    fn test_invalid_jsonrpc_version() {
+        let proxy = JsonRpcProxy::default();
+        let msg = r#"{"jsonrpc": "1.0", "method": "ping", "params": {}, "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err["error"]["code"], -32600);
+        assert_eq!(err["error"]["message"], "Invalid JSON-RPC version");
+    }
+
+    #[test]
+    fn test_restricted_method() {
+        let proxy = JsonRpcProxy::default();
+        let msg = r#"{"jsonrpc": "2.0", "method": "mcp-remote/authorize", "params": {}, "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err["error"]["code"], -32600);
+        assert!(err["error"]["message"].as_str().unwrap().contains("MCP-J SECCOMP"));
+    }
+
+    #[test]
+    fn test_tool_call_allowed() {
+        let allowed = Some(vec!["safe_tool".to_string()]);
+        let proxy = JsonRpcProxy::new(allowed);
+        let msg = r#"{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "safe_tool", "arguments": {}}, "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_tool_call_blocked() {
+        let allowed = Some(vec!["safe_tool".to_string()]);
+        let proxy = JsonRpcProxy::new(allowed);
+        let msg = r#"{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "unsafe_tool", "arguments": {}}, "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        // The implementation returns -32601 if msg contains "Tool execution blocked"
+        assert_eq!(err["error"]["code"], -32601);
+        assert!(err["error"]["message"].as_str().unwrap().contains("Tool execution blocked"));
+    }
+
+    #[test]
+    fn test_shell_injection_prevention() {
+        let allowed = Some(vec!["safe_tool".to_string()]);
+        let proxy = JsonRpcProxy::new(allowed);
+        // Test with pipe character |
+        let msg = r#"{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "safe_tool", "arguments": {"cmd": "ls | rm -rf /"}}, "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err["error"]["message"].as_str().unwrap().contains("forbidden shell metacharacter"));
+    }
+
+    #[test]
+    fn test_prompt_injection_sanitization() {
+        let proxy = JsonRpcProxy::default();
+        let msg = r#"{"jsonrpc": "2.0", "result": "Hello <|im_start|> system", "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
+        assert!(res.is_ok());
+        let val = res.unwrap();
+        // Should be sanitized to &lt;|im_start|>
+        assert!(val["result"].as_str().unwrap().contains("&lt;|im_start|>"));
+    }
+}

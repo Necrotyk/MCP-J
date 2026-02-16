@@ -349,3 +349,81 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// Helper to broadcast termination
+async fn send_termination_notification(reason: &str) {
+    let teardown_msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "mcp/server_terminated",
+        "params": { "reason": reason }
+    });
+    if let Ok(serialized) = serde_json::to_string(&teardown_msg) {
+        let payload = format!("Content-Length: {}\r\n\r\n{}", serialized.len(), serialized);
+        let mut stdout = tokio::io::stdout();
+        let _ = stdout.write_all(payload.as_bytes()).await;
+        let _ = stdout.flush().await;
+    }
+}
+
+// Phase 55: Ephemeral Garbage Collection
+fn cleanup_ephemeral(pid: u32) {
+    tracing::info!(pid, "Executing ephemeral garbage collection");
+    let upper = format!("/tmp/mcp_upper_{}", pid);
+    let work = format!("/tmp/mcp_work_{}", pid);
+
+    // We use std::fs::remove_dir_all and log warnings on failure,
+    // ensuring we don't panic during a panic hook.
+    if std::path::Path::new(&upper).exists() {
+        if let Err(e) = std::fs::remove_dir_all(&upper) {
+            tracing::warn!(path = %upper, error = %e, "Failed to remove ephemeral upper dir");
+        }
+    }
+    if std::path::Path::new(&work).exists() {
+            if let Err(e) = std::fs::remove_dir_all(&work) {
+            tracing::warn!(path = %work, error = %e, "Failed to remove ephemeral work dir");
+        }
+    }
+}
+
+async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => {
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+
+                    let lower = line.to_lowercase();
+                    if lower.starts_with("content-length:") {
+                        if let Some(val) = lower.strip_prefix("content-length:") {
+                            if let Ok(len) = val.trim().parse::<usize>() {
+                                content_length = Some(len);
+                            }
+                        }
+                    }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    if let Some(len) = content_length {
+        // Phase 53: IPC Proxy Byte Saturation Limits
+        const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10MB Limit
+        if len > MAX_PAYLOAD_SIZE {
+            return Err(anyhow::anyhow!(
+                "Payload size {} exceeds limit of {} bytes",
+                len,
+                MAX_PAYLOAD_SIZE
+            ));
+        }
+
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await?;
+        Ok(Some(buf))
+    } else {
+        Err(anyhow::anyhow!("Missing Content-Length header"))
+    }
+}
