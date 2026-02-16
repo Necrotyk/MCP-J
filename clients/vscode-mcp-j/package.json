@@ -81,11 +81,15 @@
         "name": "mcp-j",
         "description": "Query kernel traps and security boundaries.",
         "isSticky": true,
-        "welcomeMessage": "Welcome! I can help you audit security events or configure your workspace. [Auto-Configure](command:mcp-j.autoConfigure)",
+        "welcomeMessage": "Welcome! I can help you audit security events or configure your workspace. [Analyze Workspace](command:mcp-j.plan)",
         "commands": [
           {
             "name": "audit",
             "description": "Analyze the latest kernel trap."
+          },
+          {
+            "name": "plan",
+            "description": "Analyze workspace and generate a security profile."
           },
           {
             "name": "configure",
@@ -98,6 +102,16 @@
       {
         "command": "mcp-j.autoConfigure",
         "title": "MCP-J: Auto-Configure Workspace",
+        "category": "MCP-J"
+      },
+      {
+        "command": "mcp-j.plan",
+        "title": "MCP-J: Analyze Workspace",
+        "category": "MCP-J"
+      },
+      {
+        "command": "mcp-j.applyProfile",
+        "title": "MCP-J: Apply Security Profile",
         "category": "MCP-J"
       }
     ]

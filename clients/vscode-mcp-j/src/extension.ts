@@ -7,6 +7,7 @@ import { SecurityPanelProvider } from './securityPanel';
 let outputChannel: vscode.OutputChannel;
 let securityProvider: SecurityPanelProvider;
 let childProcess: cp.ChildProcess | undefined;
+let pendingManifest: string | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
     // Phase 50: Integrated Security Terminal
@@ -22,36 +23,15 @@ export async function activate(context: vscode.ExtensionContext) {
     // Phase 57: Native Chat Participant Integration
     const handler: vscode.ChatRequestHandler = async (request, context, stream, token) => {
         if (request.command === 'audit') {
-            stream.progress('Analyzing ring buffer telemetry...');
-            // Extract the last blocked event from the Ring Buffer
-            const lastTrap = securityProvider.getLastTelemetryEvent();
-
-            if (!lastTrap) {
-                stream.markdown("No security events found in the current session.");
-                return;
-            }
-
-            const prompt = `Explain this kernel trap to the developer and suggest a manifest fix: ${JSON.stringify(lastTrap)}`;
-            const messages = [vscode.LanguageModelChatMessage.User(prompt)];
-
-            try {
-                // Pass to the active Antigravity/Copilot model
-                const [model] = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
-                if (model) {
-                    const chatResponse = await model.sendRequest(messages, {}, token);
-                    for await (const fragment of chatResponse.text) {
-                        stream.markdown(fragment);
-                    }
-                } else {
-                    stream.markdown("No compatible LLM found to analyze the trap.");
-                }
-            } catch (err: any) {
-                stream.markdown(`Analysis failed: ${err.message}`);
-            }
+            await handleAuditCommand(stream, token);
+        } else if (request.command === 'plan') {
+            await handlePlanCommand(stream, token);
         } else if (request.command === 'configure') {
-            await performAutoConfiguration(stream, token);
+            // Legacy alias, redirect to plan
+            stream.markdown("Redirecting to workspace analysis...");
+            await handlePlanCommand(stream, token);
         } else {
-            stream.markdown("I can help you audit MCP-J security events. Try `@mcp-j /audit` or `@mcp-j /configure`.");
+            stream.markdown("I can help you audit MCP-J security events. Try `@mcp-j /audit` or `@mcp-j /plan`.");
         }
     };
 
@@ -59,18 +39,17 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.chat.createChatParticipant('mcp-j.securityBot', handler)
     );
 
-    // Register Auto-Configure Command
+    // Register Commands
     context.subscriptions.push(
         vscode.commands.registerCommand('mcp-j.autoConfigure', async () => {
-            // When run as a command, strictly use notifications/output, but we can reuse logic
-            // We pass undefined for stream to indicate non-chat context
-            await vscode.window.withProgress({
-                location: vscode.ProgressLocation.Notification,
-                title: "MCP-J: Generating Sandbox Profile...",
-                cancellable: true
-            }, async (progress, token) => {
-                await performAutoConfiguration(undefined, token);
-            });
+            // Programmatically open chat with the query
+            await vscode.commands.executeCommand('workbench.action.chat.open', { query: '@mcp-j /plan' });
+        }),
+        vscode.commands.registerCommand('mcp-j.plan', async () => {
+            await vscode.commands.executeCommand('workbench.action.chat.open', { query: '@mcp-j /plan' });
+        }),
+        vscode.commands.registerCommand('mcp-j.applyProfile', async () => {
+            await applyPendingProfile(context);
         })
     );
 
@@ -84,21 +63,177 @@ export async function activate(context: vscode.ExtensionContext) {
         const profileUri = vscode.Uri.joinPath(root, '.mcp-j', 'profiles', 'generic.json');
         try {
             await vscode.workspace.fs.stat(profileUri);
+            // Profile exists, start engine
+            startEngine(context);
         } catch (e) {
             // Profile does not exist
             vscode.window.showInformationMessage(
-                "MCP-J is not configured for this workspace. Generate an isolated sandbox profile using the active AI model?",
-                "Auto-Configure",
+                "MCP-J is not configured for this workspace. Analyze workspace to generate a security profile?",
+                "Analyze Workspace",
                 "Dismiss"
             ).then(selection => {
-                if (selection === 'Auto-Configure') {
-                    vscode.commands.executeCommand('mcp-j.autoConfigure');
+                if (selection === 'Analyze Workspace') {
+                    vscode.commands.executeCommand('mcp-j.plan');
                 }
             });
         }
+    } else {
+        // Even if no profile check, if we have configuration, try to start
+        // We only don't start if we are waiting for a profile
+        // Check if profile exists; if so, start.
+        if (vscode.workspace.workspaceFolders) {
+            const root = vscode.workspace.workspaceFolders[0].uri;
+            const profileUri = vscode.Uri.joinPath(root, '.mcp-j', 'profiles', 'generic.json');
+            try {
+                await vscode.workspace.fs.stat(profileUri);
+                startEngine(context);
+            } catch (e) {
+                // Do nothing, wait for user
+            }
+        }
+    }
+}
+
+async function handleAuditCommand(stream: vscode.ChatResponseStream, token: vscode.CancellationToken) {
+    stream.progress('Analyzing ring buffer telemetry...');
+    // Extract the last blocked event from the Ring Buffer
+    const lastTrap = securityProvider.getLastTelemetryEvent();
+
+    if (!lastTrap) {
+        stream.markdown("No security events found in the current session.");
+        return;
     }
 
-    // Resolve helper
+    const prompt = `Explain this kernel trap to the developer and suggest a manifest fix: ${JSON.stringify(lastTrap)}`;
+    const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+
+    try {
+        const [model] = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
+        if (model) {
+            const chatResponse = await model.sendRequest(messages, {}, token);
+            for await (const fragment of chatResponse.text) {
+                stream.markdown(fragment);
+            }
+        } else {
+            stream.markdown("No compatible LLM found to analyze the trap.");
+        }
+    } catch (err: any) {
+        stream.markdown(`Analysis failed: ${err.message}`);
+    }
+}
+
+async function handlePlanCommand(stream: vscode.ChatResponseStream, token: vscode.CancellationToken) {
+    if (!vscode.workspace.workspaceFolders) {
+        stream.markdown("No workspace open.");
+        return;
+    }
+
+    const root = vscode.workspace.workspaceFolders[0].uri;
+
+    // 1. Scan Workspace
+    stream.progress('Scanning workspace structure...');
+    const files = await vscode.workspace.fs.readDirectory(root);
+    const fileList = files.map(([name, type]) => name);
+
+    // 2. Select Model
+    const [model] = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
+    if (!model) {
+        stream.markdown("No compatible 'gpt-4o' model found.");
+        return;
+    }
+
+    // 3. Send Prompt
+    const prompt = `
+        You are a Senior Systems Security Engineer configuring the MCP-J Secure Runtime.
+        The user has a workspace with these files: ${JSON.stringify(fileList)}.
+        
+        Task:
+        1. Analyze the project structure to detect the language and framework.
+        2. Generate a 'SandboxManifest' JSON file validation against manifest.schema.json.
+        3. Enforce strict least-privilege: include '${root.fsPath}' in 'allowed_paths' and minimal network egress.
+        
+        Output:
+        - A brief explanation of the detected stack and security choices.
+        - The raw JSON content wrapped in a markdown code block (json).
+        - No other text outside the explanation.
+    `;
+
+    const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+
+    stream.progress('Generating Zero-Trust Sandbox Blueprint...');
+
+    try {
+        const response = await model.sendRequest(messages, {}, token);
+
+        let fullText = "";
+        for await (const fragment of response.text) {
+            fullText += fragment;
+            stream.markdown(fragment);
+        }
+
+        // Logic to extract JSON
+        const jsonMatch = fullText.match(/```json\s*([\s\S]*?)\s*```/) || fullText.match(/```\s*([\s\S]*?)\s*```/);
+
+        if (jsonMatch) {
+            pendingManifest = jsonMatch[1];
+            stream.markdown("\n\n---\n");
+            stream.markdown("Review the blueprint above. Click below to apply this configuration to the workspace.\n\n");
+            stream.button({
+                command: 'mcp-j.applyProfile',
+                title: 'Apply Profile'
+            });
+        } else {
+            stream.markdown("\n\n**Error:** Could not extract valid JSON from the response.");
+        }
+
+    } catch (err: any) {
+        stream.markdown(`AI Request Failed: ${err.message}`);
+    }
+}
+
+async function applyPendingProfile(context: vscode.ExtensionContext) {
+    if (!pendingManifest) {
+        vscode.window.showErrorMessage("No security profile is pending. Run '@mcp-j /plan' first.");
+        return;
+    }
+
+    if (!vscode.workspace.workspaceFolders) { return; }
+    const root = vscode.workspace.workspaceFolders[0].uri;
+
+    try {
+        // Validate JSON
+        JSON.parse(pendingManifest);
+
+        const profileDir = vscode.Uri.joinPath(root, '.mcp-j', 'profiles');
+        const profileUri = vscode.Uri.joinPath(profileDir, 'generic.json');
+
+        await vscode.workspace.fs.createDirectory(profileDir);
+        await vscode.workspace.fs.writeFile(profileUri, Buffer.from(pendingManifest));
+
+        vscode.window.showInformationMessage(`Security profile applied to ${profileUri.fsPath}`);
+
+        // Start engine now that profile exists
+        startEngine(context);
+
+        // Clear pending
+        pendingManifest = undefined;
+
+    } catch (e: any) {
+        vscode.window.showErrorMessage(`Failed to apply profile: ${e.message}`);
+    }
+}
+
+// Refactored Engine Start Logic
+function startEngine(context: vscode.ExtensionContext) {
+    // If running, kill it first
+    if (childProcess) {
+        outputChannel.appendLine("Restarting MCP-J Engine...");
+        childProcess.kill();
+        childProcess = undefined;
+    }
+
+    const config = vscode.workspace.getConfiguration('mcp-j');
+
     const resolvePath = (p: string) => {
         return p.replace(/\$\{extensionPath\}/g, context.extensionPath)
             .replace(/\$\{workspaceFolder\}/g, vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '');
@@ -113,33 +248,23 @@ export async function activate(context: vscode.ExtensionContext) {
     // Fallback logic for dev mode
     let enginePath = resolvePath(rawEnginePath);
     if (context.extensionMode === vscode.ExtensionMode.Development && !rawEnginePath.includes('target')) {
-        // If in dev mode and using default path, try target/debug
         const devPath = path.join(context.extensionPath, '../../target/debug/mcp-j-cli');
-        outputChannel.appendLine(`[DEV] Overriding engine path to: ${devPath}`);
         enginePath = devPath;
     }
 
     const profilesPath = resolvePath(rawProfilesPath);
     const manifestPath = path.join(profilesPath, defaultProfile);
 
-    // Validate if manifest exists (soft check)
-    // vscode.workspace.fs.stat(vscode.Uri.file(manifestPath)).then(...)
-
     outputChannel.appendLine(`Engine: ${enginePath}`);
     outputChannel.appendLine(`Profile: ${manifestPath}`);
     outputChannel.appendLine(`Log Level: ${logLevel.toUpperCase()}`);
-    outputChannel.appendLine(`Ephemeral: ${autoEphemeral}`);
 
-    // Spawn Process
     try {
         const env = {
             ...process.env,
             RUST_LOG: logLevel,
             MCP_J_EPHEMERAL: autoEphemeral ? "true" : "false"
         };
-
-        // Use python3 as default entrypoint for demo/testing
-        // In real usage, this might be dynamic based on the task
         const args = ['--manifest', manifestPath, '/usr/bin/python3'];
 
         outputChannel.appendLine(`Spawning: ${enginePath} ${args.join(' ')}`);
@@ -153,13 +278,6 @@ export async function activate(context: vscode.ExtensionContext) {
                     if (!line.trim()) continue;
                     handleLogLine(line);
                 }
-            });
-        }
-
-        if (childProcess.stdout) {
-            // For now just pipe to output, later this is the JSON-RPC transport
-            childProcess.stdout.on('data', (data: Buffer) => {
-                // console.log("STDOUT:", data.toString());
             });
         }
 
@@ -185,22 +303,15 @@ export async function activate(context: vscode.ExtensionContext) {
 
 function handleLogLine(line: string) {
     try {
-        // Attempt to parse structured JSON log
         const log = JSON.parse(line);
-
-        // 1. Send to Security Terminal (Phase 50)
         securityProvider.addLog(log);
-
-        // 2. Alert on High-Risk Events (Phase 51)
         detectThreats(log);
 
-        // 3. Fallback to Output Channel
         const level = log.level || "INFO";
         const msg = log.message || log.fields?.message || "";
         outputChannel.appendLine(`[${level}] ${msg}`);
 
     } catch (e) {
-        // Not JSON - probably raw stderr panic or artifact
         outputChannel.appendLine(`[RAW] ${line}`);
         securityProvider.addLog({
             timestamp: new Date().toISOString(),
@@ -212,7 +323,6 @@ function handleLogLine(line: string) {
 }
 
 function detectThreats(log: any) {
-    // Logic to detect security violations
     const isBlocked = log.message?.includes("Blocked") || log.fields?.message?.includes("Blocked");
     const isError = log.level === 'ERROR';
 
@@ -230,96 +340,5 @@ function detectThreats(log: any) {
 export function deactivate() {
     if (childProcess) {
         childProcess.kill();
-    }
-}
-
-async function performAutoConfiguration(stream?: vscode.ChatResponseStream, token?: vscode.CancellationToken) {
-    if (!vscode.workspace.workspaceFolders) {
-        if (stream) { stream.markdown("No workspace open."); }
-        else { vscode.window.showErrorMessage("No workspace open."); }
-        return;
-    }
-
-    const root = vscode.workspace.workspaceFolders[0].uri;
-
-    // 1. Scan Workspace
-    if (stream) stream.progress('Scanning workspace structure...');
-    else outputChannel.appendLine("Scanning workspace structure...");
-
-    // Basic heuristic: list top-level files
-    const files = await vscode.workspace.fs.readDirectory(root);
-    const fileList = files.map(([name, type]) => name);
-
-    // 2. Select Model
-    const [model] = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
-    if (!model) {
-        const err = "No compatible 'gpt-4o' model found.";
-        if (stream) stream.markdown(err);
-        else vscode.window.showErrorMessage(err);
-        return;
-    }
-
-    // 3. Send Prompt
-    const prompt = `
-        You are a security engineer configuring the MCP-J Secure Runtime.
-        The user has a workspace with these files: ${JSON.stringify(fileList)}.
-        
-        Generate a 'SandboxManifest' JSON file (validating against manifest.schema.json) that:
-        1. Enforces strict least-privilege for this specific project type (Node, Rust, Python, etc).
-        2. Includes '${root.fsPath}' in 'allowed_paths'.
-        3. Only allows necessary network access (e.g. if it looks like a web app).
-        
-        Return ONLY the raw JSON content within a markdown code block. No conversational text.
-    `;
-
-    const messages = [vscode.LanguageModelChatMessage.User(prompt)];
-
-    if (stream) stream.progress('Consulting AI model for least-privilege profile...');
-    else outputChannel.appendLine("Consulting AI model...");
-
-    try {
-        const response = await model.sendRequest(messages, {}, token || new vscode.CancellationTokenSource().token);
-
-        let fullText = "";
-        for await (const fragment of response.text) {
-            fullText += fragment;
-            if (stream) stream.markdown(fragment); // specific output logic?
-            // If streaming to chat, we probably shouldn't stream the raw JSON as the *only* thing 
-            // if we want to show a success message later.
-            // But requirement says "Output the generation plan and result".
-        }
-
-        // Logic to extract JSON and write it
-        const jsonMatch = fullText.match(/```json\s*([\s\S]*?)\s*```/) || fullText.match(/```\s*([\s\S]*?)\s*```/);
-        const jsonContent = jsonMatch ? jsonMatch[1] : fullText;
-
-        try {
-            // Verify it parses
-            JSON.parse(jsonContent);
-
-            const profileDir = vscode.Uri.joinPath(root, '.mcp-j', 'profiles');
-            const profileUri = vscode.Uri.joinPath(profileDir, 'generic.json');
-
-            // Ensure dir exists
-            await vscode.workspace.fs.createDirectory(profileDir);
-            await vscode.workspace.fs.writeFile(profileUri, Buffer.from(jsonContent));
-
-            const successMsg = `\n\n**Success!** generic.json generated at ${profileUri.fsPath}`;
-            if (stream) stream.markdown(successMsg);
-            else {
-                outputChannel.appendLine(successMsg);
-                vscode.window.showInformationMessage("MCP-J Profile successfully generated!");
-            }
-
-        } catch (parseErr) {
-            const msg = `Failed to parse generated JSON: ${parseErr}`;
-            if (stream) stream.markdown(`\n\n**Error**: ${msg}`);
-            else vscode.window.showErrorMessage(msg);
-        }
-
-    } catch (err: any) {
-        const msg = `AI Request Failed: ${err.message}`;
-        if (stream) stream.markdown(msg);
-        else vscode.window.showErrorMessage(msg);
     }
 }
