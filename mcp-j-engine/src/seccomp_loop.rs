@@ -187,6 +187,13 @@ impl SeccompLoop {
     }
     
     fn resp_error(&self, req: &seccomp_notif, error: i32) -> seccomp_notif_resp {
+        // Phase 58: "Dry-Run" Profiler (Audit Mode)
+        use crate::manifest::SecurityMode;
+        if self.manifest.mode == SecurityMode::Audit {
+            tracing::warn!(id = req.id, "AUDIT MODE: Allowing violation that would have been blocked");
+            return self.resp_continue(req);
+        }
+
         seccomp_notif_resp {
             id: req.id,
             val: 0,

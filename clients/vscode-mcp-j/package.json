@@ -68,6 +68,21 @@
         "fileMatch": ".mcp-j/profiles/*.json",
         "url": "./resources/manifest.schema.json"
       }
+    ],
+    "chatParticipants": [
+      {
+        "id": "mcp-j.securityBot",
+        "fullName": "MCP-J Sentinel",
+        "name": "mcp-j",
+        "description": "Query kernel traps and security boundaries.",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "audit",
+            "description": "Analyze the latest kernel trap."
+          }
+        ]
+      }
     ]
   },
   "main": "./out/extension.js",

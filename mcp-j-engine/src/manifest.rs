@@ -1,6 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecurityMode {
+    Enforcing,
+    Audit,
+}
+
+impl Default for SecurityMode {
+    fn default() -> Self {
+        SecurityMode::Enforcing
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxManifest {
     #[serde(default = "default_max_memory_mb")]
@@ -17,6 +30,9 @@ pub struct SandboxManifest {
 
     #[serde(default = "default_max_cpu_quota_pct")]
     pub max_cpu_quota_pct: u32,
+
+    #[serde(default)]
+    pub mode: SecurityMode,
 }
 
 fn default_max_cpu_quota_pct() -> u32 {
@@ -42,6 +58,7 @@ impl Default for SandboxManifest {
             ],
             env_vars: HashMap::new(),
             max_cpu_quota_pct: 100,
+            mode: SecurityMode::Enforcing,
         }
     }
 }

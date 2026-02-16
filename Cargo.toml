@@ -7,7 +7,9 @@ members = [
 resolver = "2"
 
 [profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+opt-level = "z"        # Optimize for size (aggressively)
+lto = "fat"            # Whole-program Link Time Optimization
+codegen-units = 1      # Disable parallel codegen for maximum compression
+strip = "symbols"      # Strip all debug and panic symbol tables
+panic = "abort"        # Drop stack-unwinding code (saves ~300KB)
+

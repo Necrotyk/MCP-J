@@ -29,13 +29,34 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
     }
 
+    private _logBuffer: any[] = [];
+    private readonly MAX_BUFFER_SIZE = 50;
+
     public addLog(entry: any) {
+        // Maintain local ring buffer for query answering
+        this._logBuffer.push(entry);
+        if (this._logBuffer.length > this.MAX_BUFFER_SIZE) {
+            this._logBuffer.shift();
+        }
+
         if (this._view) {
             this._view.webview.postMessage({ type: 'log', entry: entry });
         }
     }
 
+    public getLastTelemetryEvent(): any | undefined {
+        // Return latest interesting event (preferably an error or block)
+        // If none, return the absolute last log
+        const reversed = [...this._logBuffer].reverse();
+        const block = reversed.find(e => {
+            const msg = e.message || e.fields?.message || "";
+            return msg.includes("Blocked") || e.level === 'ERROR';
+        });
+        return block || reversed[0];
+    }
+
     public clear() {
+        this._logBuffer = [];
         if (this._view) {
             this._view.webview.postMessage({ type: 'clear' });
         }

@@ -15,6 +15,44 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewViewProvider(SecurityPanelProvider.viewType, securityProvider)
     );
 
+    // Phase 57: Native Chat Participant Integration
+    const handler: vscode.ChatRequestHandler = async (request, context, stream, token) => {
+        if (request.command === 'audit') {
+            stream.progress('Analyzing ring buffer telemetry...');
+            // Extract the last blocked event from the Ring Buffer
+            const lastTrap = securityProvider.getLastTelemetryEvent();
+
+            if (!lastTrap) {
+                stream.markdown("No security events found in the current session.");
+                return;
+            }
+
+            const prompt = `Explain this kernel trap to the developer and suggest a manifest fix: ${JSON.stringify(lastTrap)}`;
+            const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+
+            try {
+                // Pass to the active Antigravity/Copilot model
+                const [model] = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
+                if (model) {
+                    const chatResponse = await model.sendRequest(messages, {}, token);
+                    for await (const fragment of chatResponse.text) {
+                        stream.markdown(fragment);
+                    }
+                } else {
+                    stream.markdown("No compatible LLM found to analyze the trap.");
+                }
+            } catch (err: any) {
+                stream.markdown(`Analysis failed: ${err.message}`);
+            }
+        } else {
+            stream.markdown("I can help you audit MCP-J security events. Try `@mcp-j /audit`.");
+        }
+    };
+
+    context.subscriptions.push(
+        vscode.chat.createChatParticipant('mcp-j.securityBot', handler)
+    );
+
     outputChannel = vscode.window.createOutputChannel("MCP-J Runtime");
     outputChannel.show(true);
     outputChannel.appendLine("MCP-J Secure Runtime Initializing...");
