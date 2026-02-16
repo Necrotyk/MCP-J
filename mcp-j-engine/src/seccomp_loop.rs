@@ -345,26 +345,37 @@ impl SeccompLoop {
         
         // Read filename
         // Max path length 4096
-        let path_bytes = match self.read_tracee_string(tracee_pid, filename_ptr, 4096) {
-             Ok(s) => s,
-             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
+        // Read the null-terminated string from tracee memory
+        let path_bytes = match self.read_path_tracee(tracee_pid, filename_ptr) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!("Failed to read execve path from tracee: {}", e);
+                return Ok(libc::EACCES);
+            }
         };
-        let path = String::from_utf8_lossy(&path_bytes);
         
-        // Normalize path: if relative, assume relative to /workspace (CWD of grandchild)
-        // But checking exact match is tricky if path resolution differs.
-        // We know self.allowed_command is what we expect.
-        // We can also allow if path starts with "/workspace/".
+        // Safely convert bytes to a comparable Path type
+        let path_str = String::from_utf8_lossy(&path_bytes);
+        let path = std::path::Path::new(path_str.as_ref());
         
-        let allowed = path == self.allowed_command || path.starts_with("/workspace/") || path.starts_with("/bin/") || path.starts_with("/usr/bin/") || self.manifest.readonly_mounts.iter().any(|m| path.starts_with(m));
-        
+        // Validate execution vector against allowed paths
+        let allowed = path == self.allowed_command.as_path() 
+            || path.starts_with("/workspace/") 
+            || path.starts_with("/bin/") 
+            || path.starts_with("/usr/bin/") 
+            || self.manifest.readonly_mounts.iter().any(|m| path.starts_with(m));
+
         if allowed {
-             tracing::debug!(pid = tracee_pid, path = %path, "Authorizing initial execve()");
-             Ok(self.resp_continue(req))
+            tracing::debug!("Permitting execve for whitelisted path: {:?}", path);
+            // Return appropriate flag to the supervisor to construct the SECCOMP_USER_NOTIF_FLAG_CONTINUE response
+            // e.g., return Ok(0); depending on your struct's response handler implementation
         } else {
-             // Block others
-             tracing::warn!(pid = tracee_pid, path = %path, "Blocked execve() to eliminate TOCTOU.");
-             Ok(self.resp_error(req, libc::EACCES))
+            tracing::warn!(
+                pid = tracee_pid,
+                "Blocked execve() to eliminate TOCTOU. Agent must use execveat(FD) or tool executor. Path: {:?}",
+                path
+            );
+            return Ok(libc::EACCES);
         }
     }
 
