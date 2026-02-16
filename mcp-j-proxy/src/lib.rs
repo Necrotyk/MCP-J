@@ -31,6 +31,20 @@ impl JsonRpcProxy {
     }
 
     pub fn validate_and_parse(&self, message: &str) -> Result<Value, Value> {
+        // Phase 53: IPC Proxy Byte Saturation Limits
+        const MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+        if message.len() > MAX_PAYLOAD_BYTES {
+             let err = serde_json::json!({
+                 "jsonrpc": "2.0",
+                 "error": {
+                     "code": -32600,
+                     "message": format!("IPC_PAYLOAD_OVERFLOW: Payload exceeds maximum allowed size of {} bytes", MAX_PAYLOAD_BYTES)
+                 },
+                 "id": null
+             });
+             return Err(err);
+        }
+
         // 1. Strict JSON-RPC 2.0 Parsing
         // We parse into Value first to extract ID even if partial structs fail.
         let raw: Value = match serde_json::from_str(message) {
