@@ -15,35 +15,15 @@ impl Default for SecurityMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SandboxManifest {
-    #[serde(default = "default_max_memory_mb")]
     pub max_memory_mb: u64,
-    
-    #[serde(default)]
     pub allowed_egress_ips: Vec<String>,
-    
-    #[serde(default)]
     pub readonly_mounts: Vec<String>,
-    
-    #[serde(default)]
     pub env_vars: HashMap<String, String>,
-
-    #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
-
-    #[serde(default = "default_max_cpu_quota_pct")]
     pub max_cpu_quota_pct: u32,
-
-    #[serde(default)]
     pub mode: SecurityMode,
-}
-
-fn default_max_cpu_quota_pct() -> u32 {
-    100
-}
-
-fn default_max_memory_mb() -> u64 {
-    512
 }
 
 impl Default for SandboxManifest {
@@ -67,5 +47,67 @@ impl Default for SandboxManifest {
             max_cpu_quota_pct: 100,
             mode: SecurityMode::Enforcing,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn test_manifest_default_values() {
+        let manifest = SandboxManifest::default();
+        assert_eq!(manifest.max_memory_mb, 512);
+        assert!(manifest.allowed_egress_ips.contains(&"127.0.0.1".to_string()));
+        assert!(manifest.readonly_mounts.contains(&"/bin".to_string()));
+        assert_eq!(manifest.max_cpu_quota_pct, 100);
+        assert_eq!(manifest.mode, SecurityMode::Enforcing);
+        assert!(manifest.allowed_tools.is_some());
+        let tools = manifest.allowed_tools.as_ref().unwrap();
+        assert!(tools.contains(&"read_file".to_string()));
+    }
+
+    #[test]
+    fn test_manifest_serialization_roundtrip() {
+        let manifest = SandboxManifest::default();
+        let json = serde_json::to_string(&manifest).expect("Failed to serialize");
+        let deserialized: SandboxManifest = serde_json::from_str(&json).expect("Failed to deserialize");
+
+        assert_eq!(deserialized.max_memory_mb, manifest.max_memory_mb);
+        assert_eq!(deserialized.allowed_egress_ips, manifest.allowed_egress_ips);
+        assert_eq!(deserialized.readonly_mounts, manifest.readonly_mounts);
+        assert_eq!(deserialized.max_cpu_quota_pct, manifest.max_cpu_quota_pct);
+        assert_eq!(deserialized.mode, manifest.mode);
+        assert_eq!(deserialized.allowed_tools, manifest.allowed_tools);
+    }
+
+    #[test]
+    fn test_manifest_deserialization_defaults() {
+        let json = r#"{}"#;
+        let manifest: SandboxManifest = serde_json::from_str(json).expect("Failed to deserialize empty object");
+
+        let expected = SandboxManifest::default();
+
+        assert_eq!(manifest.max_memory_mb, expected.max_memory_mb);
+        assert_eq!(manifest.max_cpu_quota_pct, expected.max_cpu_quota_pct);
+        assert_eq!(manifest.mode, expected.mode);
+        assert_eq!(manifest.allowed_egress_ips, expected.allowed_egress_ips);
+        assert_eq!(manifest.readonly_mounts, expected.readonly_mounts);
+        assert_eq!(manifest.allowed_tools, expected.allowed_tools);
+    }
+
+    #[test]
+    fn test_manifest_partial_deserialization() {
+        let json = r#"{"max_memory_mb": 1024, "mode": "audit"}"#;
+        let manifest: SandboxManifest = serde_json::from_str(json).expect("Failed to deserialize partial object");
+
+        assert_eq!(manifest.max_memory_mb, 1024);
+        assert_eq!(manifest.mode, SecurityMode::Audit);
+
+        // Other fields should still be at their defaults
+        let expected = SandboxManifest::default();
+        assert_eq!(manifest.allowed_egress_ips, expected.allowed_egress_ips);
+        assert_eq!(manifest.readonly_mounts, expected.readonly_mounts);
     }
 }
