@@ -123,7 +123,7 @@ impl SeccompLoop {
             let mut req: seccomp_notif = unsafe { std::mem::zeroed() };
             
             // ioctl call
-            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_RECV as libc::c_int, &mut req) };
+            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_RECV as libc::c_ulong, &mut req) };
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -139,7 +139,7 @@ impl SeccompLoop {
             let resp = self.handle_request(&req)?;
 
             // Send response
-            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND as libc::c_int, &resp) };
+            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND as libc::c_ulong, &resp) };
             if ret < 0 {
                  let err = std::io::Error::last_os_error();
                  // If process died between RECV and SEND, acceptable.
@@ -523,7 +523,7 @@ impl SeccompLoop {
             newfd_flags: 0,
         };
         
-        let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_int, &mut addfd) };
+        let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong, &mut addfd) };
         if ret < 0 {
              let err = std::io::Error::last_os_error();
              return Err(anyhow::anyhow!("ioctl ADDFD failed: {}", err));
