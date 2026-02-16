@@ -208,7 +208,7 @@ impl JsonRpcProxy {
             Value::String(s) => {
                 // Phase 4: CVE-2025-6514 Shell Metacharacter Scrubbing
                 // Reject sequences: $(, `, |, ;, &&, ||, >
-                let forbidden = ["$(", "`", "|", ";", "&&", "||", ">"];
+                let forbidden = ["$(", "`", "||", "&&", "|", ";", ">"];
                 for pattern in forbidden {
                     if s.contains(pattern) {
                          return Err(format!("Argument contains forbidden shell metacharacter sequence '{}'", pattern));
@@ -231,3 +231,125 @@ impl JsonRpcProxy {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_metacharacter_scrubbing() {
+        let proxy = JsonRpcProxy::default();
+
+        let forbidden_patterns = [
+            ("$(", "Argument contains forbidden shell metacharacter sequence '$('"),
+            ("`", "Argument contains forbidden shell metacharacter sequence '`'"),
+            ("|", "Argument contains forbidden shell metacharacter sequence '|'"),
+            (";", "Argument contains forbidden shell metacharacter sequence ';'"),
+            ("&&", "Argument contains forbidden shell metacharacter sequence '&&'"),
+            ("||", "Argument contains forbidden shell metacharacter sequence '||'"),
+            (">", "Argument contains forbidden shell metacharacter sequence '>'"),
+        ];
+
+        for (pattern, expected_msg) in forbidden_patterns {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "test_tool",
+                    "arguments": {
+                        "input": format!("some_prefix{}some_suffix", pattern)
+                    }
+                },
+                "id": 1
+            }).to_string();
+
+            let result = proxy.validate_and_parse(&request);
+            assert!(result.is_err(), "Should have failed for pattern: {}", pattern);
+
+            let err = result.unwrap_err();
+            let err_msg = err["error"]["message"].as_str().expect("Error message should be a string");
+
+            assert!(
+                err_msg.contains(expected_msg),
+                "Expected error message containing '{}', got '{}'",
+                expected_msg,
+                err_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_arguments() {
+        let proxy = JsonRpcProxy::default();
+        let valid_inputs = [
+            "simple_string",
+            "string with spaces",
+            "path/to/file.txt",
+            "12345",
+            "-flag",
+            "--long-flag"
+        ];
+
+        for input in valid_inputs {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "test_tool",
+                    "arguments": {
+                        "input": input
+                    }
+                },
+                "id": 1
+            }).to_string();
+
+            let result = proxy.validate_and_parse(&request);
+            assert!(result.is_ok(), "Should have succeeded for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_nested_shell_metacharacters() {
+        let proxy = JsonRpcProxy::default();
+
+        // Nested inside an array
+        let request_array = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "test_tool",
+                "arguments": {
+                    "files": ["safe.txt", "unsafe;rm -rf /"]
+                }
+            },
+            "id": 1
+        }).to_string();
+
+        let result_array = proxy.validate_and_parse(&request_array);
+        assert!(result_array.is_err(), "Should fail for nested array with forbidden char");
+
+        let err_array = result_array.unwrap_err();
+        assert!(err_array["error"]["message"].as_str().unwrap().contains("Argument contains forbidden shell metacharacter sequence ';'"));
+
+        // Nested inside an object
+        let request_object = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "test_tool",
+                "arguments": {
+                    "config": {
+                        "path": "/var/log",
+                        "command": "echo hello | grep world"
+                    }
+                }
+            },
+            "id": 1
+        }).to_string();
+
+        let result_object = proxy.validate_and_parse(&request_object);
+        assert!(result_object.is_err(), "Should fail for nested object with forbidden char");
+
+        let err_object = result_object.unwrap_err();
+        assert!(err_object["error"]["message"].as_str().unwrap().contains("Argument contains forbidden shell metacharacter sequence '|'"));
+    }
+}
