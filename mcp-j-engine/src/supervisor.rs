@@ -97,6 +97,7 @@ impl Supervisor {
         // Task 5: Enable Landlock Network Rules if manifest requires networking
         if !self.manifest.allowed_egress_ips.is_empty() || !self.manifest.allowed_egress_ipv6.is_empty() {
              self.landlock_ruleset.allow_all_tcp_connect();
+             self.landlock_ruleset.allow_tcp_ports(&self.manifest.allowed_egress_ports);
              // Bind? Usually agents act as clients.
         }
     }

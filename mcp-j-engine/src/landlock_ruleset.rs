@@ -1,6 +1,6 @@
 use landlock::{
     Access, AccessFs, AccessNet, Ruleset, ABI, RulesetStatus, RulesetAttr, RulesetCreatedAttr,
-    PathBeneath
+    PathBeneath, NetPortRule
 };
 use std::collections::HashMap;
 use anyhow::Result;
@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use enumflags2::BitFlags;
 
 #[derive(Clone)]
-#[derive(Clone)]
 pub struct LandlockRuleset {
     allowed_paths: HashMap<PathBuf, BitFlags<AccessFs>>,
     allow_tcp_connect: bool,
     allow_tcp_bind: bool,
+    allowed_tcp_ports: Vec<u16>,
 }
 
 impl LandlockRuleset {
@@ -21,6 +21,7 @@ impl LandlockRuleset {
             allowed_paths: HashMap::new(),
             allow_tcp_connect: false,
             allow_tcp_bind: false,
+            allowed_tcp_ports: Vec::new(),
         })
     }
 
@@ -29,10 +30,17 @@ impl LandlockRuleset {
         self
     }
     
+    pub fn allow_tcp_ports(&mut self, ports: &[u16]) -> &mut Self {
+        self.allowed_tcp_ports.extend_from_slice(ports);
+        self
+    }
+    
     pub fn allow_all_tcp_bind(&mut self) -> &mut Self {
         self.allow_tcp_bind = true;
         self
     }
+// ... (skip unchanged methods)
+
 
     pub fn allow_read<P: Into<PathBuf>>(&mut self, path: P) -> &mut Self {
         let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
@@ -57,13 +65,16 @@ impl LandlockRuleset {
             .into_iter()
             .find(|&abi| {
                 // Check if we can create a ruleset with this ABI's FS flags
-                Ruleset::new().handle_access(AccessFs::from_all(abi)).create().is_ok()
+                Ruleset::default()
+                    .handle_access(AccessFs::from_all(abi))
+                    .and_then(|b| b.create())
+                    .is_ok()
             })
             .unwrap_or(ABI::V1);
 
         tracing::info!("Detected Landlock ABI version: {:?}", supported_abi);
 
-        let mut builder = Ruleset::new()
+        let mut builder = Ruleset::default()
             .handle_access(AccessFs::from_all(supported_abi))?;
             
         // Task 5: Network Rules (V4+)
@@ -86,14 +97,18 @@ impl LandlockRuleset {
             use landlock::net::NetPortRule;
             if self.allow_tcp_connect {
                 // Task 5: Landlock V4 Network Enforcement
-                // Allow common ports for agent activity
-                let ports = [80, 443, 53, 3000, 8000, 8080, 22]; 
+                // Dynamic ports from manifest
+                let ports = if self.allowed_tcp_ports.is_empty() {
+                     vec![80, 443] 
+                } else {
+                     self.allowed_tcp_ports.clone()
+                };
+                
                 for port in ports {
                     let rule = NetPortRule::new(port, AccessNet::ConnectTcp);
                     match ruleset.add_rule(rule) {
                         Ok(r) => ruleset = r,
                         Err(e) => {
-                             // Log but continue? Landlock failures might be critical.
                              eprintln!("Failed to add network rule for port {}: {}", port, e);
                              return Err(anyhow::anyhow!("Failed to add network rule"));
                         }

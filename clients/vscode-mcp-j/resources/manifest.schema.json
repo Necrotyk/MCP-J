@@ -18,10 +18,27 @@
         },
         "allowed_egress_ips": {
             "type": "array",
-            "description": "List of IPv4/IPv6 addresses allowed for outbound connections.",
+            "description": "List of IPv4 addresses allowed for outbound connections.",
             "items": {
                 "type": "string",
                 "format": "ipv4"
+            }
+        },
+        "allowed_egress_ipv6": {
+            "type": "array",
+            "description": "List of IPv6 addresses allowed for outbound connections.",
+            "items": {
+                "type": "string",
+                "format": "ipv6"
+            }
+        },
+        "allowed_egress_ports": {
+            "type": "array",
+            "description": "List of TCP ports allowed for outbound connections (default: [80, 443]).",
+            "items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
             }
         },
         "readonly_mounts": {

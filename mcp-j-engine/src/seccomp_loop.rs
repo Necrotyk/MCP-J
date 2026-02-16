@@ -1,5 +1,5 @@
 use anyhow::{Result};
-use std::os::unix::io::{RawFd, AsRawFd};
+use std::os::unix::io::{RawFd, AsRawFd, FromRawFd};
 use libc::{pid_t};
 use crate::seccomp_sys::{
     seccomp_notif, seccomp_notif_resp,
@@ -499,8 +499,44 @@ impl SeccompLoop {
                  }
             },
             libc::AF_INET6 => {
-                 tracing::warn!(pid = pid, family = "IPv6", "Blocked outbound connection");
-                 Ok(self.resp_error(req, libc::EACCES))
+                 // Task 2: Harmonized IPv6 Validation
+                 if addr_len < std::mem::size_of::<libc::sockaddr_in6>() {
+                      return Ok(self.resp_error(req, libc::EINVAL));
+                 }
+                 
+                 let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                 unsafe {
+                     std::ptr::copy_nonoverlapping(
+                         buf.as_ptr(), 
+                         &mut sin6 as *mut _ as *mut u8, 
+                         std::mem::size_of::<libc::sockaddr_in6>()
+                     );
+                 }
+                 
+                 // Handle IPv4-Mapped IPv6 (::ffff:1.2.3.4)
+                 let raw_ip = u128::from_be_bytes(sin6.sin6_addr.s6_addr);
+                 
+                 // Check valid IPv4 mapped prefix: ::ffff:0:0/96
+                 if (raw_ip >> 32) == 0x0000_0000_0000_0000_0000_FFFF {
+                     // Extract IPv4 part
+                     let ipv4_part = (raw_ip & 0xFFFFFFFF) as u32;
+                     
+                     if self.allowed_ips.contains(&ipv4_part) {
+                         Ok(self.resp_continue(req))
+                     } else {
+                         let ip_addr = std::net::Ipv4Addr::from(ipv4_part);
+                         tracing::warn!(pid = pid, dst_ip = %ip_addr, "Blocked outbound UDP/TCP (v4-mapped) (sendto/msg)");
+                         Ok(self.resp_error(req, libc::EACCES))
+                     }
+                 } else {
+                     if self.allowed_ips_v6.contains(&raw_ip) {
+                         Ok(self.resp_continue(req))
+                     } else {
+                         let ip_addr = std::net::Ipv6Addr::from(raw_ip);
+                         tracing::warn!(pid = pid, dst_ip = %ip_addr, "Blocked outbound IPv6 UDP/TCP (sendto/msg)");
+                         Ok(self.resp_error(req, libc::EACCES))
+                     }
+                 }
             },
             _ => Ok(self.resp_error(req, libc::EAFNOSUPPORT))
         }

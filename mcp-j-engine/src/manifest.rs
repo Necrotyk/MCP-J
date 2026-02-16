@@ -26,6 +26,8 @@ pub struct SandboxManifest {
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub allowed_dns_resolvers: Vec<String>,
+    #[serde(default)]
+    pub allowed_egress_ports: Vec<u16>,
     pub max_cpu_quota_pct: u32,
     pub mode: SecurityMode,
 }
@@ -36,6 +38,7 @@ impl Default for SandboxManifest {
             max_memory_mb: 512,
             allowed_egress_ips: vec!["127.0.0.1".to_string()],
             allowed_egress_ipv6: vec!["::1".to_string()],
+            allowed_egress_ports: vec![80, 443], // Task 3: Default ports
             readonly_mounts: vec![
                 "/lib".to_string(), 
                 "/lib64".to_string(), 

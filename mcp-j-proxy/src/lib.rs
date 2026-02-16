@@ -191,9 +191,20 @@ impl JsonRpcProxy {
 
         if let Some(args) = params_obj.get("arguments") {
             // Task 4.2: Schema Enforcement
-            // We perform strict type checking for known tools to prevent type confusion.
             self.validate_tool_schema(name, args)?;
-            self.validate_arguments(args, 0)?;
+            
+            // Task 1: Schema-Aware Validation
+            // If the tool schema is strictly validated (like read_file path), 
+            // we can skip the shell-sensitive deep inspection for those known tools.
+            // This prevents false positives on valid paths that might look like shell args.
+            match name {
+                "read_file" | "list_directory" => {
+                    // Implicitly trusted because we use File::open directly (no shell)
+                },
+                _ => {
+                    self.validate_arguments(args, 0)?;
+                }
+            }
         }
         Ok(())
     }
@@ -212,7 +223,7 @@ impl JsonRpcProxy {
                  if !args_obj["path"].is_string() { return Err("'path' must be a string".into()); }
                  if args_obj.len() != 1 { return Err("Unexpected arguments for list_directory".into()); }
             },
-            // For unknown tools, we rely on validate_arguments (whitelist)
+            // For unknown tools, we rely on validate_arguments (deny-list)
             _ => {}
         }
         Ok(())
@@ -232,12 +243,14 @@ impl JsonRpcProxy {
         
         match args {
             Value::String(s) => {
-                // Task 4.1: Whitelist-only policy for shell-sensitive fields
-                // We allow alphanumeric, '-', '_', '/', '.', and spaces.
-                // Replaces the infinite blacklist game.
-                let allowed_re = regex::Regex::new(r"^[a-zA-Z0-9\-_/\.\s]*$").unwrap();
-                if !allowed_re.is_match(s) {
-                     return Err(format!("Argument contains characters violating whitelist policy: '{}'", s));
+                // Task 4.1: Shell-Metacharacter-Deny-List
+                // Replaces the aggressive whitelist. We block specific characters that 
+                // trigger shell execution/redirection/expansion.
+                // Block: | ; & $ > < ` \
+                // We allow: " ' ( ) { } , * ? [ ] etc.
+                let deny_re = regex::Regex::new(r"[|;&$><`\\]").unwrap();
+                if deny_re.is_match(s) {
+                     return Err(format!("Argument contains forbidden shell metacharacter: '{}'", s));
                 }
             }
             Value::Array(arr) => {

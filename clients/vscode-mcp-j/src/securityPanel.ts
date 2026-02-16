@@ -96,6 +96,7 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
                     .highlight-egress { color: #f48771; } /* Reddish */
                     .highlight-fs { color: #cca700; } /* Yellowish */
                     .highlight-rpc { color: #89d185; } /* Greenish */
+                    .highlight-ipv6 { color: #569cd6; font-weight: bold; } /* Blueish for IPv6 */
 
                 </style>
 			</head>
@@ -154,9 +155,12 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
                         const rawMsg = entry.message || entry.fields?.message || '';
                         msgSpan.textContent = rawMsg;
                         
-                        if (rawMsg.includes('Blocked') || entry.fields?.error) {
                             div.classList.add('error');
                             msgSpan.classList.add('highlight-egress');
+                        }
+
+                        if (rawMsg.includes('IPv6')) {
+                            msgSpan.classList.add('highlight-ipv6');
                         }
                         
                         div.appendChild(msgSpan);
