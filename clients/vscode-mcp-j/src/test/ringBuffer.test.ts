@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { RingBuffer } from '../securityPanel';
+import { RingBuffer } from '../common/RingBuffer';
 
 suite('RingBuffer Test Suite', () => {
 

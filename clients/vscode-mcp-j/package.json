@@ -122,15 +122,18 @@
     "watch": "tsc -watch -p ./",
     "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/main.js --external:vscode --format=cjs --platform=node",
     "rebuild": "bash ./scripts/dev-cycle.sh",
-    "reset": "bash ./scripts/reset-config.sh"
+    "reset": "bash ./scripts/reset-config.sh",
+    "test-unit": "npm run compile && mocha out/test/**/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.6",
     "@types/node": "^20.19.33",
     "@types/vscode": "1.90.0",
     "esbuild": "^0.27.3",
+    "mocha": "^11.7.5",
     "typescript": "^5.0.0"
   },
   "repository": {
