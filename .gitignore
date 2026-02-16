@@ -11,6 +11,7 @@ target/
 node_modules/
 **/node_modules/
 clients/vscode-mcp-j/out/
+clients/vscode-mcp-j/bin/
 clients/vscode-mcp-j/dist/
 clients/vscode-mcp-j/*.vsix
 clients/vscode-mcp-j/.vscode-test/
