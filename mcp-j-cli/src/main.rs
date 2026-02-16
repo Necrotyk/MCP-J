@@ -35,6 +35,24 @@ async fn main() -> anyhow::Result<()> {
     
     tracing::info!(command = ?cli.command, "Launching jailed process");
     
+    // Task 3.2: Stale Cgroup Cleanup
+    if let Ok(entries) = std::fs::read_dir("/sys/fs/cgroup") {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if name.starts_with("mcp-j-") {
+                     let path = entry.path();
+                     let procs_path = path.join("cgroup.procs");
+                     if let Ok(content) = std::fs::read_to_string(&procs_path) {
+                         if content.trim().is_empty() {
+                             tracing::info!(path = ?path, "Removing stale empty cgroup");
+                             let _ = std::fs::remove_dir(&path);
+                         }
+                     }
+                }
+            }
+        }
+    }
+    
     mcp_j_engine::check_kernel_compatibility()?;
 
     let binary = std::path::PathBuf::from(&cli.command[0]);

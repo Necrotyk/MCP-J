@@ -23,6 +23,7 @@ pub struct SeccompLoop {
     allowed_command: PathBuf,
     manifest: SandboxManifest,
     allowed_ips: HashSet<u32>,
+    allowed_ips_v6: HashSet<u128>,
 }
 
 impl SeccompLoop {
@@ -49,7 +50,20 @@ impl SeccompLoop {
             }
         }
     
-        Self { notify_fd, project_root, allowed_command, manifest, allowed_ips }
+        let mut allowed_ips_v6 = HashSet::new();
+        // Always allow localhost IPv6
+        allowed_ips_v6.insert(0x0000_0000_0000_0000_0000_0000_0000_0001); // ::1
+        
+        // Task 2.1: Allowed Egress IPv6
+        for ip_str in &manifest.allowed_egress_ipv6 {
+            if let Ok(ip) = ip_str.parse::<std::net::Ipv6Addr>() {
+                 allowed_ips_v6.insert(u128::from(ip));
+            } else {
+                 tracing::warn!(ip = %ip_str, "Failed to parse allowed egress IPv6 in manifest");
+            }
+        }
+
+        Self { notify_fd, project_root, allowed_command, manifest, allowed_ips, allowed_ips_v6 }
     }
     
     // Helper to read memory from the tracee
@@ -161,6 +175,7 @@ impl SeccompLoop {
         match syscall {
             libc::SYS_connect => self.handle_connect(req),
             libc::SYS_execve => self.handle_execve(req),
+            322 => self.handle_execveat(req), // SYS_execveat x86_64
             libc::SYS_bind => self.handle_bind(req),
             libc::SYS_sendto => self.handle_sendto(req),
             libc::SYS_sendmsg => self.handle_sendmsg(req),
@@ -268,10 +283,49 @@ impl SeccompLoop {
                  }
             },
             libc::AF_INET6 => {
-                 // Block all IPv6 unless allowed?
-                 // Does manifest allow IPv6 strings?
-                 tracing::warn!(pid = tracee_pid, family = "IPv6", "Blocked outbound connection");
-                 Ok(self.resp_error(req, libc::EACCES))
+                 // Task 2.2: IPv6 Validation
+                 if addr_len < std::mem::size_of::<libc::sockaddr_in6>() {
+                      return Ok(self.resp_error(req, libc::EINVAL));
+                 }
+                 
+                 let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                 unsafe {
+                     std::ptr::copy_nonoverlapping(
+                         buf.as_ptr(), 
+                         &mut sin6 as *mut _ as *mut u8, 
+                         std::mem::size_of::<libc::sockaddr_in6>()
+                     );
+                 }
+                 
+                 // Handle IPv4-Mapped IPv6 (::ffff:1.2.3.4)
+                 let raw_ip = u128::from_be_bytes(sin6.sin6_addr.s6_addr);
+                 
+                 // Check valid IPv4 mapped prefix: ::ffff:0:0/96
+                 if (raw_ip >> 32) == 0x0000_0000_0000_0000_0000_FFFF {
+                     // Extract IPv4 part
+                     let ipv4_part = (raw_ip & 0xFFFFFFFF) as u32;
+                     // ipv4_part is already in host order relative to the extraction? warning: be careful with endianness.
+                     // u128::from_be_bytes converts to NATIVE endian u128.
+                     // The bytes were Network Order.
+                     // So raw_ip is now Host Order u128 representing the IP.
+                     // ::ffff:127.0.0.1 -> 00...FFFF7F000001
+                     
+                     if self.allowed_ips.contains(&ipv4_part) {
+                         Ok(self.resp_continue(req))
+                     } else {
+                         let ip_addr = std::net::Ipv4Addr::from(ipv4_part);
+                         tracing::warn!(pid = tracee_pid, dst_ip = %ip_addr, "Blocked outbound IPv4-mapped IPv6 connection");
+                         Ok(self.resp_error(req, libc::EACCES))
+                     }
+                 } else {
+                     if self.allowed_ips_v6.contains(&raw_ip) {
+                         Ok(self.resp_continue(req))
+                     } else {
+                         let ip_addr = std::net::Ipv6Addr::from(raw_ip);
+                         tracing::warn!(pid = tracee_pid, dst_ip = %ip_addr, "Blocked outbound IPv6 connection");
+                         Ok(self.resp_error(req, libc::EACCES))
+                     }
+                 }
             },
             _ => {
                  // Deny unknown families
@@ -281,42 +335,59 @@ impl SeccompLoop {
     }
 
     fn handle_execve(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
-        use std::os::unix::ffi::OsStrExt;
-        let ptr = req.data.args[0];
+        // Task 1: Eliminate execve TOCTOU
+        // Strategy: We Block execve() and require the agent to use execveat() with a pre-validated FD.
+        // This forces the "Fallback Logic" (Fail Closed) for standard execve, unless we can use ptrace to rewrite it.
+        // Given architectural constraints (no ptrace on parent), we return EACCES.
         let tracee_pid = req.pid as pid_t;
-        
-        let path_bytes = match self.read_path_tracee(tracee_pid, ptr) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to read execve path: {}", e);
-                return Ok(self.resp_error(req, libc::EFAULT));
-            }
-        };
+        tracing::warn!(pid = tracee_pid, "Blocked execve() to eliminate TOCTOU. Agent must use execveat(FD) or tool executor.");
+        Ok(self.resp_error(req, libc::EACCES))
+    }
 
-        // Phase 30: Lexical Path Traversal Eradication
-        if path_bytes.windows(2).any(|w| w == b"..") {
-            tracing::warn!(pid = tracee_pid, "Blocked execve with directory traversal payload ('..')");
-            return Ok(self.resp_error(req, libc::EACCES));
+    fn handle_execveat(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+        // execveat(dirfd, pathname, argv, envp, flags)
+        let dirfd = req.data.args[0] as i32;
+        let _ptr = req.data.args[1]; 
+        let flags = req.data.args[4] as i32;
+        let tracee_pid = req.pid as pid_t;
+
+        // Verify AT_EMPTY_PATH to ensure FD is used
+        if (flags & libc::AT_EMPTY_PATH) == 0 {
+             tracing::warn!(pid = tracee_pid, "Blocked execveat() without AT_EMPTY_PATH (TOCTOU risk)");
+             return Ok(self.resp_error(req, libc::EACCES));
         }
-
-        // Check against readonly mounts prefixes (byte comparison)
+        
+        // Resolve FD from tracee
+        // We need to verify if the file pointed to by dirfd is allowed.
+        // We use pidfd_getfd to duplicate it to supervisor and check path.
+        
+        let pidfd = unsafe { libc::syscall(crate::seccomp_sys::SYS_PIDFD_OPEN, tracee_pid, 0) };
+        if pidfd < 0 { return Ok(self.resp_error(req, 0-libc::ESRCH)); }
+        
+        let dup_fd = unsafe { libc::syscall(crate::seccomp_sys::SYS_PIDFD_GETFD, pidfd, dirfd, 0) };
+        unsafe { libc::close(pidfd as i32) };
+        
+        if dup_fd < 0 { return Ok(self.resp_error(req, libc::EBADF)); }
+        
+        let file = unsafe { std::fs::File::from_raw_fd(dup_fd as i32) };
+        
+        // Get path from FD
+        // /proc/self/fd/N -> link
+        let fd_path = format!("/proc/self/fd/{}", dup_fd);
+        let link_path = match std::fs::read_link(&fd_path) {
+            Ok(p) => p,
+            Err(_) => return Ok(self.resp_error(req, libc::EACCES)),
+        };
+        
+        // Verify path against manifest
         let is_allowed = self.manifest.readonly_mounts.iter().any(|prefix| {
-            let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();
-            path_bytes.starts_with(prefix_bytes)
-        }) || path_bytes == self.allowed_command.as_os_str().as_bytes()
-           || path_bytes.starts_with(b"/workspace/"); // Phase 24: Enable Workspace Execution
+            link_path.starts_with(prefix)
+        }) || link_path == self.allowed_command || link_path.starts_with("/workspace/");
 
         if is_allowed {
-             // Phase 21: TOCTOU Acknowledgment
-             // Note: There is a theoretical Time-Of-Check-Time-Of-Use race here where the tracee
-             // could swap the path memory after we read it but before the kernel executes it.
-             // We rely on Landlock LSM as the authoritative security boundary to prevent unauthorized execution.
-             tracing::debug!(pid = tracee_pid, "Authorizing execve (Landlock will enforce final boundary)");
+             tracing::debug!(pid = tracee_pid, path = ?link_path, "Authorizing execveat(FD)");
              Ok(self.resp_continue(req))
         } else {
-             // Reconstruct lossy string for logging
-             let path_lossy = String::from_utf8_lossy(&path_bytes);
-             tracing::warn!(pid = tracee_pid, path = %path_lossy, "Blocked execve (Not in allowed RO mounts)");
              Ok(self.resp_error(req, libc::EACCES))
         }
     }

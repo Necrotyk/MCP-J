@@ -93,6 +93,12 @@ impl Supervisor {
         for mount_path in &self.manifest.readonly_mounts {
             self.landlock_ruleset.allow_read(mount_path);
         }
+        
+        // Task 5: Enable Landlock Network Rules if manifest requires networking
+        if !self.manifest.allowed_egress_ips.is_empty() || !self.manifest.allowed_egress_ipv6.is_empty() {
+             self.landlock_ruleset.allow_all_tcp_connect();
+             // Bind? Usually agents act as clients.
+        }
     }
 
     fn create_pipes(&self) -> Result<Pipes> {
@@ -425,23 +431,29 @@ impl CgroupGuard {
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
+        // Task 3.1: Subtree Control (cgroup.kill)
+        // Try to signal kill to all processes atomically via cgroup.kill (v2)
+        let kill_file = self.path.join("cgroup.kill");
+        if kill_file.exists() {
+             if let Err(e) = std::fs::write(&kill_file, "1") {
+                  tracing::warn!(error = %e, "Failed to write to cgroup.kill. Falling back to manual kill loop.");
+             }
+        }
+
         let procs_path = self.path.join("cgroup.procs");
-        if let Ok(content) = std::fs::read_to_string(&procs_path) {
-            for line in content.lines() {
-                if let Ok(pid) = line.trim().parse::<i32>() {
-                    unsafe { libc::kill(pid, libc::SIGKILL); }
+        // Fallback or V1 cleanup
+        for _ in 0..5 {
+            if let Ok(content) = std::fs::read_to_string(&procs_path) {
+                if content.trim().is_empty() { break; }
+                for line in content.lines() {
+                    if let Ok(pid) = line.trim().parse::<i32>() {
+                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                    }
                 }
             }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        for _ in 0..10 {
-            if let Ok(content) = std::fs::read_to_string(&procs_path) {
-                 if content.trim().is_empty() { break; }
-                 for line in content.lines() {
-                     if let Ok(pid) = line.trim().parse::<i32>() { unsafe { libc::kill(pid, libc::SIGKILL); } }
-                 }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        
         let _ = std::fs::remove_dir(&self.path);
     }
 }

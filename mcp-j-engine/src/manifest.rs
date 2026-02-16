@@ -19,6 +19,8 @@ impl Default for SecurityMode {
 pub struct SandboxManifest {
     pub max_memory_mb: u64,
     pub allowed_egress_ips: Vec<String>,
+    #[serde(default)]
+    pub allowed_egress_ipv6: Vec<String>,
     pub readonly_mounts: Vec<String>,
     pub env_vars: HashMap<String, String>,
     pub allowed_tools: Option<Vec<String>>,
@@ -33,6 +35,7 @@ impl Default for SandboxManifest {
         Self {
             max_memory_mb: 512,
             allowed_egress_ips: vec!["127.0.0.1".to_string()],
+            allowed_egress_ipv6: vec!["::1".to_string()],
             readonly_mounts: vec![
                 "/lib".to_string(), 
                 "/lib64".to_string(), 

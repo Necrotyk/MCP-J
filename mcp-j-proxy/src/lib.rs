@@ -190,7 +190,30 @@ impl JsonRpcProxy {
         }
 
         if let Some(args) = params_obj.get("arguments") {
+            // Task 4.2: Schema Enforcement
+            // We perform strict type checking for known tools to prevent type confusion.
+            self.validate_tool_schema(name, args)?;
             self.validate_arguments(args, 0)?;
+        }
+        Ok(())
+    }
+
+    fn validate_tool_schema(&self, name: &str, args: &Value) -> Result<(), String> {
+        let args_obj = args.as_object().ok_or("Arguments must be an object")?;
+        
+        match name {
+            "read_file" => {
+                if !args_obj.contains_key("path") { return Err("Missing 'path' argument".into()); }
+                if !args_obj["path"].is_string() { return Err("'path' must be a string".into()); }
+                if args_obj.len() != 1 { return Err("Unexpected arguments for read_file".into()); }
+            },
+            "list_directory" => {
+                 if !args_obj.contains_key("path") { return Err("Missing 'path' argument".into()); }
+                 if !args_obj["path"].is_string() { return Err("'path' must be a string".into()); }
+                 if args_obj.len() != 1 { return Err("Unexpected arguments for list_directory".into()); }
+            },
+            // For unknown tools, we rely on validate_arguments (whitelist)
+            _ => {}
         }
         Ok(())
     }
@@ -209,14 +232,12 @@ impl JsonRpcProxy {
         
         match args {
             Value::String(s) => {
-                // Phase 4: CVE-2025-6514 Shell Metacharacter Scrubbing
-                // Task 3.1: Expand forbidden list
-                // Reject sequences: $(, `, |, ;, &&, ||, >, \n, \r, {, }, [
-                let forbidden = ["$(", "`", "||", "&&", "|", ";", ">", "\n", "\r", "{", "}", "["];
-                for pattern in forbidden {
-                    if s.contains(pattern) {
-                         return Err(format!("Argument contains forbidden shell metacharacter sequence '{}'", pattern));
-                    }
+                // Task 4.1: Whitelist-only policy for shell-sensitive fields
+                // We allow alphanumeric, '-', '_', '/', '.', and spaces.
+                // Replaces the infinite blacklist game.
+                let allowed_re = regex::Regex::new(r"^[a-zA-Z0-9\-_/\.\s]*$").unwrap();
+                if !allowed_re.is_match(s) {
+                     return Err(format!("Argument contains characters violating whitelist policy: '{}'", s));
                 }
             }
             Value::Array(arr) => {
