@@ -207,8 +207,8 @@ impl JsonRpcProxy {
         match args {
             Value::String(s) => {
                 // Phase 4: CVE-2025-6514 Shell Metacharacter Scrubbing
-                // Reject sequences: $(, `, |, ;, &&, ||, >
-                let forbidden = ["$(", "`", "|", ";", "&&", "||", ">"];
+                // Reject sequences: $, `, |, ;, &, <, >
+                let forbidden = ["$", "`", "|", ";", "&", "<", ">"];
                 for pattern in forbidden {
                     if s.contains(pattern) {
                          return Err(format!("Argument contains forbidden shell metacharacter sequence '{}'", pattern));
