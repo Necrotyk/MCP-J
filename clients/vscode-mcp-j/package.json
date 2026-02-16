@@ -42,6 +42,11 @@
           "type": "boolean",
           "default": true,
           "description": "Enable volatile overlay filesystem (ephemeral state)."
+        },
+        "mcp-j.autoConfigureOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically prompt to configure MCP-J if no profile is found."
         }
       }
     },
@@ -76,12 +81,24 @@
         "name": "mcp-j",
         "description": "Query kernel traps and security boundaries.",
         "isSticky": true,
+        "welcomeMessage": "Welcome! I can help you audit security events or configure your workspace. [Auto-Configure](command:mcp-j.autoConfigure)",
         "commands": [
           {
             "name": "audit",
             "description": "Analyze the latest kernel trap."
+          },
+          {
+            "name": "configure",
+            "description": "Generate a security profile for this workspace."
           }
         ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "mcp-j.autoConfigure",
+        "title": "MCP-J: Auto-Configure Workspace",
+        "category": "MCP-J"
       }
     ]
   },
