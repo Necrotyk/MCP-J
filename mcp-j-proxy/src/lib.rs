@@ -64,9 +64,12 @@ impl JsonRpcProxy {
         let id = raw.get("id").cloned().unwrap_or(Value::Null);
 
         // Check if it's a Request (has method) or Response (has result/error)
-        if raw.get("method").is_some() {
+        let is_request = raw.get("method").is_some();
+
+        if is_request {
             // Handle Request
-            let request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
+            // Optimization: Consuming `raw` instead of cloning it prevents large copy.
+            let request: JsonRpcRequest = match serde_json::from_value(raw) {
                 Ok(r) => r,
                 Err(e) => {
                     let err = serde_json::json!({
