@@ -62,7 +62,13 @@
           "type": "webview"
         }
       ]
-    }
+    },
+    "jsonValidation": [
+      {
+        "fileMatch": ".mcp-j/profiles/*.json",
+        "url": "./resources/manifest.schema.json"
+      }
+    ]
   },
   "main": "./out/extension.js",
   "scripts": {

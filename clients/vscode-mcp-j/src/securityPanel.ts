@@ -90,6 +90,7 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
 				<script nonce="${nonce}">
                     const vscode = acquireVsCodeApi();
                     const container = document.getElementById('log-container');
+                    const MAX_LOG_LINES = 1000;
 
                     window.addEventListener('message', event => {
                         const message = event.data;
@@ -102,6 +103,15 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
                                 break;
                         }
                     });
+                    
+                    function escapeHtml(unsafe) {
+                        return unsafe
+                             .replace(/&/g, "&amp;")
+                             .replace(/</g, "&lt;")
+                             .replace(/>/g, "&gt;")
+                             .replace(/"/g, "&quot;")
+                             .replace(/'/g, "&#039;");
+                    }
 
                     function addLogEntry(entry) {
                         const div = document.createElement('div');
@@ -120,16 +130,17 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
                         // Target/Source
                         const targetSpan = document.createElement('span');
                         targetSpan.className = 'target';
+                        // Safe textContent usage
                         targetSpan.textContent = \`[\${entry.target || entry.source || 'unknown'}]\`;
                         div.appendChild(targetSpan);
 
-                        // Message
+                        // Message with heuristic highlighting (TextContent is safe)
                         const msgSpan = document.createElement('span');
                         msgSpan.className = 'message';
-                        msgSpan.textContent = entry.message || entry.fields?.message || '';
+                        const rawMsg = entry.message || entry.fields?.message || '';
+                        msgSpan.textContent = rawMsg;
                         
-                        // Heuristic highlighting
-                        if (entry.message?.includes('Blocked') || entry.fields?.error) {
+                        if (rawMsg.includes('Blocked') || entry.fields?.error) {
                             div.classList.add('error');
                             msgSpan.classList.add('highlight-egress');
                         }
@@ -137,25 +148,30 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
                         div.appendChild(msgSpan);
 
                         // Extra Fields
+                        let fieldsObj = null;
                         if (entry.fields) {
-                            const fieldsDiv = document.createElement('div');
-                            fieldsDiv.className = 'fields';
-                            // Filter out redundant message field
                             const { message, ...rest } = entry.fields;
-                            if (Object.keys(rest).length > 0) {
-                                fieldsDiv.textContent = JSON.stringify(rest, null, 2);
-                            }
-                            div.appendChild(fieldsDiv);
+                            if (Object.keys(rest).length > 0) fieldsObj = rest;
                         } else if (entry.pid || entry.dst_ip) {
-                             // Handle top-level fields if flat JSON
+                            const { timestamp, level, message, target, ...rest } = entry;
+                            fieldsObj = rest;
+                        }
+
+                        if (fieldsObj) {
                             const fieldsDiv = document.createElement('div');
                             fieldsDiv.className = 'fields';
-                             const { timestamp, level, message, target, ...rest } = entry;
-                             fieldsDiv.textContent = JSON.stringify(rest, null, 2);
-                             div.appendChild(fieldsDiv);
+                            // Utilize JSON.stringify which is safe for textContent
+                            fieldsDiv.textContent = JSON.stringify(fieldsObj, null, 2);
+                            div.appendChild(fieldsDiv);
                         }
 
                         container.appendChild(div);
+                        
+                        // Ring Buffer Logic (Phase 50.2)
+                        while (container.childNodes.length > MAX_LOG_LINES) {
+                            container.removeChild(container.firstChild);
+                        }
+
                         window.scrollTo(0, document.body.scrollHeight);
                     }
                 </script>
