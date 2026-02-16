@@ -82,9 +82,11 @@ async fn main() -> anyhow::Result<()> {
             "params": { "reason": reason }
         });
         if let Ok(serialized) = serde_json::to_string(&teardown_msg) {
-            let payload = format!("Content-Length: {}\r\n\r\n{}", serialized.len(), serialized);
+            let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
             let mut stdout = tokio::io::stdout();
-            let _ = stdout.write_all(payload.as_bytes()).await;
+            // Split write to avoid large string allocation
+            let _ = stdout.write_all(header.as_bytes()).await;
+            let _ = stdout.write_all(serialized.as_bytes()).await;
             let _ = stdout.flush().await;
         }
     }
@@ -180,11 +182,15 @@ async fn main() -> anyhow::Result<()> {
                                      continue;
                                  }
                              };
-                             let len = serialized.len();
-                             let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
+                             let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
                              
-                             if let Err(e) = child_stdin.write_all(payload.as_bytes()).await {
-                                 tracing::error!(error = %e, "Failed to write to child stdin");
+                             // Split write to avoid large string allocation
+                             if let Err(e) = child_stdin.write_all(header.as_bytes()).await {
+                                 tracing::error!(error = %e, "Failed to write header to child stdin");
+                                 break;
+                             }
+                             if let Err(e) = child_stdin.write_all(serialized.as_bytes()).await {
+                                 tracing::error!(error = %e, "Failed to write body to child stdin");
                                  break;
                              }
                              let _ = child_stdin.flush().await;
@@ -197,10 +203,11 @@ async fn main() -> anyhow::Result<()> {
                                      continue;
                                  }
                              };
-                             let len = serialized.len();
-                             let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
+                             let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
                              let mut stdout = tokio::io::stdout();
-                             let _ = stdout.write_all(payload.as_bytes()).await;
+                             // Split write to avoid large string allocation
+                             let _ = stdout.write_all(header.as_bytes()).await;
+                             let _ = stdout.write_all(serialized.as_bytes()).await;
                              let _ = stdout.flush().await;
                         }
                     }
@@ -240,12 +247,16 @@ async fn main() -> anyhow::Result<()> {
                                      continue;
                                  }
                              };
-                             let len = serialized.len();
-                             let payload = format!("Content-Length: {}\r\n\r\n{}", len, serialized);
+                             let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
                              
                              let mut stdout = tokio::io::stdout();
-                             if let Err(e) = stdout.write_all(payload.as_bytes()).await {
-                                 tracing::error!(error = %e, "Failed to write to host stdout");
+                             // Split write to avoid large string allocation
+                             if let Err(e) = stdout.write_all(header.as_bytes()).await {
+                                 tracing::error!(error = %e, "Failed to write header to host stdout");
+                                 break;
+                             }
+                             if let Err(e) = stdout.write_all(serialized.as_bytes()).await {
+                                 tracing::error!(error = %e, "Failed to write body to host stdout");
                                  break;
                              }
                              let _ = stdout.flush().await;
