@@ -14,8 +14,9 @@ clients/vscode-mcp-j/out/
 clients/vscode-mcp-j/dist/
 clients/vscode-mcp-j/*.vsix
 clients/vscode-mcp-j/.vscode-test/
-clients/vscode-mcp-j/package-lock.json
+clients/vscode-mcp-j/bin/mcp-j-cli
 clients/vscode-mcp-j/package.json
+clients/vscode-mcp-j/package-lock.json
 *.tsbuildinfo
 
 # --- Fuzzing ---
