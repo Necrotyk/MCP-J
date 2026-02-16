@@ -136,12 +136,17 @@ impl JsonRpcProxy {
             .map_err(|_| "Invalid params structure for tools/call".to_string())?;
 
         if let Some(args) = tool_params.arguments {
-            self.validate_arguments(&args)?;
+            self.validate_arguments(&args, 0)?;
         }
         Ok(())
     }
 
-    fn validate_arguments(&self, args: &Value) -> Result<(), String> {
+    fn validate_arguments(&self, args: &Value, depth: usize) -> Result<(), String> {
+        const MAX_RECURSION_DEPTH: usize = 128;
+        if depth > MAX_RECURSION_DEPTH {
+            return Err(format!("Recursion limit exceeded at depth {}", depth));
+        }
+
         // Validation logic for user-space (proxy) has been simplified.
         // We rely on kernel-level enforcement (Landlock, Seccomp) for security.
         // The proxy mainly ensures structural integrity of JSON-RPC 2.0.
@@ -154,12 +159,12 @@ impl JsonRpcProxy {
             }
             Value::Array(arr) => {
                 for item in arr {
-                    self.validate_arguments(item)?;
+                    self.validate_arguments(item, depth + 1)?;
                 }
             }
             Value::Object(map) => {
                 for (_, value) in map {
-                    self.validate_arguments(value)?;
+                    self.validate_arguments(value, depth + 1)?;
                 }
             }
             _ => {}

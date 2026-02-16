@@ -1,5 +1,5 @@
 [package]
-name = "mcp-j-engine-fuzz"
+name = "mcp-j-proxy-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -12,10 +12,3 @@ libfuzzer-sys = "0.4"
 
 [dependencies.mcp-j-proxy]
 path = ".."
-
-[[bin]]
-name = "parse_rpc"
-path = "fuzz_targets/parse_rpc.rs"
-test = false
-doc = false
-bench = false
