@@ -86,6 +86,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Phase 55: Ephemeral Garbage Collection
+    fn cleanup_ephemeral(pid: u32) {
+        tracing::info!(pid, "Executing ephemeral garbage collection");
+        let upper = format!("/tmp/mcp_upper_{}", pid);
+        let work = format!("/tmp/mcp_work_{}", pid);
+        
+        // We use std::fs::remove_dir_all and log warnings on failure, 
+        // ensuring we don't panic during a panic hook.
+        if std::path::Path::new(&upper).exists() {
+            if let Err(e) = std::fs::remove_dir_all(&upper) {
+                tracing::warn!(path = %upper, error = %e, "Failed to remove ephemeral upper dir");
+            }
+        }
+        if std::path::Path::new(&work).exists() {
+             if let Err(e) = std::fs::remove_dir_all(&work) {
+                tracing::warn!(path = %work, error = %e, "Failed to remove ephemeral work dir");
+            }
+        }
+    }
+
     async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
         let mut content_length = None;
         loop {
@@ -111,7 +131,8 @@ async fn main() -> anyhow::Result<()> {
         }
         
         if let Some(len) = content_length {
-            const MAX_PAYLOAD_SIZE: usize = 5 * 1024 * 1024;
+            // Phase 53: IPC Proxy Byte Saturation Limits
+            const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10MB Limit
             if len > MAX_PAYLOAD_SIZE {
                 return Err(anyhow::anyhow!(
                     "Payload size {} exceeds limit of {} bytes",
@@ -245,7 +266,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let child_pid = child.pid.as_raw();
+    let child_pid = child.pid.as_raw() as u32;
+    
+    // Phase 55: Register Panic Hook
+    let pid_clone = child_pid;
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(panic = ?info, "CLI Panicked! cleaning up...");
+        cleanup_ephemeral(pid_clone);
+    }));
     
     // Wait for child exit
     let wait_task = tokio::task::spawn_blocking(move || {
@@ -275,14 +303,17 @@ async fn main() -> anyhow::Result<()> {
         _ = sigint.recv() => {
             tracing::warn!("SIGINT trapped. Executing strict teardown sequence.");
             send_termination_notification("host_signal_sigint").await;
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid as i32), nix::sys::signal::Signal::SIGKILL);
         },
         _ = sigterm.recv() => {
             tracing::warn!("SIGTERM trapped. Executing strict teardown sequence.");
             send_termination_notification("host_signal_sigterm").await;
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid as i32), nix::sys::signal::Signal::SIGKILL);
         }
     }
+    
+    // Normal exit cleanup
+    cleanup_ephemeral(child_pid);
 
     Ok(())
 }

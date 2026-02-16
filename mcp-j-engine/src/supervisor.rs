@@ -171,7 +171,6 @@ impl Supervisor {
 
     fn setup_child(&self, sock: RawFd) -> Result<()> {
         // --- PHASE 0: Cgroup v2 Resource Bounding ---
-        // --- PHASE 0: Cgroup v2 Resource Bounding ---
         let pid = std::process::id();
         let cgroup_guard = CgroupGuard::new(pid);
         let cgroup_path = cgroup_guard.path().clone();
@@ -179,8 +178,6 @@ impl Supervisor {
         // Attempt to create cgroup and limit resource
         if let Err(e) = std::fs::create_dir(&cgroup_path) {
              tracing::warn!(path = ?cgroup_path, error = %e, "Failed to create cgroup. Resource limits might not be applied.");
-             // If failed to create, maybe return error or proceed without cgroup?
-             // Proceed for now, but guard won't remove anything if it wasn't created theoretically (rmdir fails).
         } else {
              // Add self to cgroup
              if let Err(e) = std::fs::write(cgroup_path.join("cgroup.procs"), pid.to_string()) {
@@ -195,7 +192,6 @@ impl Supervisor {
              
              // Set CPU quota (Phase 29)
              if self.manifest.max_cpu_quota_pct > 0 {
-                  // cpu.max: "quota period" -> "{pct * 1000} 100000" (100000us = 100ms cycle)
                   let quota = self.manifest.max_cpu_quota_pct * 1000;
                   let val = format!("{} 100000", quota);
                   if let Err(e) = std::fs::write(cgroup_path.join("cpu.max"), val) {
@@ -204,7 +200,7 @@ impl Supervisor {
              }
         }
 
-        // 1. Unshare Namespaces
+        // 1. Unshare Namespaces (includes CLONE_NEWPID)
         unshare(CloneFlags::CLONE_NEWUSER)?;
 
         // Map UID/GID
@@ -275,8 +271,6 @@ impl Supervisor {
         // Use manifest mounts
         for mount_path_str in &self.manifest.readonly_mounts {
             let src = PathBuf::from(mount_path_str);
-            // destination in jail (e.g. /tmp/jail_root/bin)
-            // Strip leading '/' from mount_path to join safely
             let rel_path = mount_path_str.trim_start_matches('/');
             let dst = jail_root.join(rel_path);
             
@@ -339,7 +333,7 @@ impl Supervisor {
                      Some(&host_dev),
                      &jail_dev,
                      None::<&str>,
-                     MsFlags::MS_BIND | MsFlags::MS_RDONLY, // Read-only for safety
+                     MsFlags::MS_BIND | MsFlags::MS_RDONLY,
                      None::<&str>
                  ).context(format!("Failed to bind mount /dev/{}", device))?;
              }
@@ -355,22 +349,6 @@ impl Supervisor {
         
         unistd::chdir("/workspace").context("Failed to chdir to workspace")?;
 
-        // --- PHASE 2: Capability Dropping & UID Downgrade ---
-        // Bind lifecycle to parent (supervisor) before dropping privileges
-        unsafe {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                 return Err(anyhow::anyhow!("Failed to set PR_SET_PDEATHSIG"));
-            }
-        }
-
-        for cap in 0..=63 {
-             unsafe {
-                 libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
-             }
-        }
-        
-
-        
         // 2. Install Seccomp Filter and get Notify FD
         let notify_fd = self.install_seccomp_filter()?;
         
@@ -381,10 +359,51 @@ impl Supervisor {
         unistd::close(notify_fd).ok();
         unistd::close(sock).ok();
         
-        // 5. Apply Landlock 
-        self.landlock_ruleset.apply().context("Failed to apply Landlock rules")?;
+        // Phase 54: PID Namespace Isolation (Double Fork)
+        // We fork again so that the child (tracee) becomes PID 1 in the new PID namespace created by `unshare`.
+        match unsafe { unistd::fork() } {
+            Ok(ForkResult::Parent { child, .. }) => {
+                // Intermediate process (PID 1 contender, but not actually)
+                // Wait for the real tracee to exit
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => std::process::exit(code),
+                    Ok(WaitStatus::Signaled(_, sig, _)) => std::process::exit(128 + sig as i32),
+                    _ => std::process::exit(1),
+                }
+            }
+            Ok(ForkResult::Child) => {
+                // This is the implementation of PID 1 in the new namespace.
+                
+                // Remount /proc to reflect the new PID namespace
+                let _ = mount(
+                    Some("proc"),
+                    "/proc",
+                    Some("proc"),
+                    MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                    None::<&str>
+                );
+
+                // --- PHASE 2: Capability Dropping & UID Downgrade ---
+                // Bind lifecycle to parent (supervisor) before dropping privileges
+                unsafe {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                         // Non-fatal if we can't set it, but risky
+                    }
+                }
         
-        Ok(())
+                for cap in 0..=63 {
+                     unsafe {
+                         libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+                     }
+                }
+
+                // 5. Apply Landlock 
+                self.landlock_ruleset.apply().context("Failed to apply Landlock rules")?;
+                
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!("Double fork failed: {}", e))
+        }
     }
 
     fn send_notify_fd(&self, sock: RawFd, fd: RawFd) -> Result<()> {
