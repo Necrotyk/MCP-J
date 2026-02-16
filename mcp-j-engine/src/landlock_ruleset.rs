@@ -19,15 +19,17 @@ impl LandlockRuleset {
         })
     }
 
-    pub fn allow_read<P: Into<PathBuf>>(mut self, path: P) -> Self {
+    pub fn allow_read<P: Into<PathBuf>>(&mut self, path: P) -> &mut Self {
         let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
-        self.allowed_paths.insert(path.into(), access);
+        let mut p: PathBuf = path.into();
+        self.allowed_paths.insert(p, access);
         self
     }
 
-    pub fn allow_write<P: Into<PathBuf>>(mut self, path: P) -> Self {
+    pub fn allow_write<P: Into<PathBuf>>(&mut self, path: P) -> &mut Self {
         let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute | AccessFs::WriteFile | AccessFs::RemoveDir | AccessFs::RemoveFile | AccessFs::MakeChar | AccessFs::MakeDir | AccessFs::MakeReg | AccessFs::MakeSock | AccessFs::MakeFifo | AccessFs::MakeBlock | AccessFs::MakeSym;
-        self.allowed_paths.insert(path.into(), access);
+        let mut p: PathBuf = path.into();
+        self.allowed_paths.insert(p, access);
         self
     }
 

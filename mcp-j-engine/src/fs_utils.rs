@@ -6,7 +6,10 @@ use libc::c_long;
 
 // openat2 constants - normally in linux/openat2.h or fcntl.h
 // If libc doesn't define them, we define them.
-const SYS_OPENAT2: c_long = 437; // x86_64
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const SYS_OPENAT2: c_long = 437; 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("Unsupported architecture for openat2 syscall");
 const RESOLVE_BENEATH: u64 = 0x08;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 

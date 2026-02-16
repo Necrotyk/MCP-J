@@ -74,86 +74,6 @@ async fn main() -> anyhow::Result<()> {
     
     let host_stdin = tokio::io::stdin();
 
-    // Helper to broadcast termination
-    async fn send_termination_notification(reason: &str) {
-        let teardown_msg = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "mcp/server_terminated",
-            "params": { "reason": reason }
-        });
-        if let Ok(serialized) = serde_json::to_string(&teardown_msg) {
-            let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
-            let mut stdout = tokio::io::stdout();
-            // Split write to avoid large string allocation
-            let _ = stdout.write_all(header.as_bytes()).await;
-            let _ = stdout.write_all(serialized.as_bytes()).await;
-            let _ = stdout.flush().await;
-        }
-    }
-
-    // Phase 55: Ephemeral Garbage Collection
-    fn cleanup_ephemeral(pid: u32) {
-        tracing::info!(pid, "Executing ephemeral garbage collection");
-        let upper = format!("/tmp/mcp_upper_{}", pid);
-        let work = format!("/tmp/mcp_work_{}", pid);
-        
-        // We use std::fs::remove_dir_all and log warnings on failure, 
-        // ensuring we don't panic during a panic hook.
-        if std::path::Path::new(&upper).exists() {
-            if let Err(e) = std::fs::remove_dir_all(&upper) {
-                tracing::warn!(path = %upper, error = %e, "Failed to remove ephemeral upper dir");
-            }
-        }
-        if std::path::Path::new(&work).exists() {
-             if let Err(e) = std::fs::remove_dir_all(&work) {
-                tracing::warn!(path = %work, error = %e, "Failed to remove ephemeral work dir");
-            }
-        }
-    }
-
-    async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line).await {
-                Ok(0) => return Ok(None),
-                Ok(_) => {
-                     if line == "\r\n" || line == "\n" {
-                         break;
-                     }
-                     
-                     let lower = line.to_lowercase();
-                     if lower.starts_with("content-length:") {
-                         if let Some(val) = lower.strip_prefix("content-length:") {
-                             if let Ok(len) = val.trim().parse::<usize>() {
-                                 content_length = Some(len);
-                             }
-                         }
-                     }
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        
-        if let Some(len) = content_length {
-            // Phase 53: IPC Proxy Byte Saturation Limits
-            const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10MB Limit
-            if len > MAX_PAYLOAD_SIZE {
-                return Err(anyhow::anyhow!(
-                    "Payload size {} exceeds limit of {} bytes",
-                    len,
-                    MAX_PAYLOAD_SIZE
-                ));
-            }
-
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await?;
-            Ok(Some(buf))
-        } else {
-            Err(anyhow::anyhow!("Missing Content-Length header"))
-        }
-    }
-
     // Inbound Task: Host Stdin -> Proxy -> Child Stdin
     let proxy_in = proxy.clone();
     let mut reader_in = tokio::io::BufReader::new(host_stdin);
@@ -161,10 +81,11 @@ async fn main() -> anyhow::Result<()> {
     let stdin_writer_clone = stdin_writer.clone();
 
     let inbound_task = tokio::spawn(async move {
+        let mut buf = Vec::with_capacity(4096);
         loop {
-            match read_lsp_message(&mut reader_in).await {
-                Ok(Some(msg_bytes)) => {
-                    let msg_str = match std::str::from_utf8(&msg_bytes) {
+            match read_lsp_message(&mut reader_in, &mut buf).await {
+                Ok(Some(())) => {
+                    let msg_str = match std::str::from_utf8(&buf) {
                         Ok(s) => s,
                         Err(e) => {
                              tracing::error!(error = %e, "Invalid UTF-8 in LSP message");
@@ -184,7 +105,6 @@ async fn main() -> anyhow::Result<()> {
                              };
                              let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
                              
-                             // Split write to avoid large string allocation
                              if let Err(e) = child_stdin.write_all(header.as_bytes()).await {
                                  tracing::error!(error = %e, "Failed to write header to child stdin");
                                  break;
@@ -205,7 +125,6 @@ async fn main() -> anyhow::Result<()> {
                              };
                              let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
                              let mut stdout = tokio::io::stdout();
-                             // Split write to avoid large string allocation
                              let _ = stdout.write_all(header.as_bytes()).await;
                              let _ = stdout.write_all(serialized.as_bytes()).await;
                              let _ = stdout.flush().await;
@@ -227,10 +146,11 @@ async fn main() -> anyhow::Result<()> {
     let mut reader_out = tokio::io::BufReader::new(async_child_stdout);
     
     let outbound_task = tokio::spawn(async move {
+         let mut buf = Vec::with_capacity(4096);
          loop {
-            match read_lsp_message(&mut reader_out).await {
-                Ok(Some(msg_bytes)) => {
-                    let msg_str = match std::str::from_utf8(&msg_bytes) {
+            match read_lsp_message(&mut reader_out, &mut buf).await {
+                Ok(Some(())) => {
+                    let msg_str = match std::str::from_utf8(&buf) {
                         Ok(s) => s,
                         Err(e) => {
                              tracing::error!(error = %e, "Invalid UTF-8 in child outbound message");
@@ -250,7 +170,6 @@ async fn main() -> anyhow::Result<()> {
                              let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
                              
                              let mut stdout = tokio::io::stdout();
-                             // Split write to avoid large string allocation
                              if let Err(e) = stdout.write_all(header.as_bytes()).await {
                                  tracing::error!(error = %e, "Failed to write header to host stdout");
                                  break;
@@ -371,7 +290,7 @@ fn cleanup_ephemeral(pid: u32) {
     let upper = format!("/tmp/mcp_upper_{}", pid);
     let work = format!("/tmp/mcp_work_{}", pid);
 
-    // We use std::fs::remove_dir_all and log warnings on failure,
+    // We use std::fs::remove_dir_all and log warnings on failure, 
     // ensuring we don't panic during a panic hook.
     if std::path::Path::new(&upper).exists() {
         if let Err(e) = std::fs::remove_dir_all(&upper) {
@@ -379,36 +298,36 @@ fn cleanup_ephemeral(pid: u32) {
         }
     }
     if std::path::Path::new(&work).exists() {
-            if let Err(e) = std::fs::remove_dir_all(&work) {
+         if let Err(e) = std::fs::remove_dir_all(&work) {
             tracing::warn!(path = %work, error = %e, "Failed to remove ephemeral work dir");
         }
     }
 }
 
-async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
+async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> anyhow::Result<Option<()>> {
     let mut content_length = None;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line).await {
             Ok(0) => return Ok(None),
             Ok(_) => {
-                    if line == "\r\n" || line == "\n" {
-                        break;
-                    }
-
-                    let lower = line.to_lowercase();
-                    if lower.starts_with("content-length:") {
-                        if let Some(val) = lower.strip_prefix("content-length:") {
-                            if let Ok(len) = val.trim().parse::<usize>() {
-                                content_length = Some(len);
-                            }
-                        }
-                    }
+                 if line == "\r\n" || line == "\n" {
+                     break;
+                 }
+                 
+                 let lower = line.to_lowercase();
+                 if lower.starts_with("content-length:") {
+                     if let Some(val) = lower.strip_prefix("content-length:") {
+                         if let Ok(len) = val.trim().parse::<usize>() {
+                             content_length = Some(len);
+                         }
+                     }
+                 }
             }
             Err(e) => return Err(e.into()),
         }
     }
-
+    
     if let Some(len) = content_length {
         // Phase 53: IPC Proxy Byte Saturation Limits
         const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10MB Limit
@@ -420,9 +339,9 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow:
             ));
         }
 
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf).await?;
-        Ok(Some(buf))
+        buf.resize(len, 0); // Reuse buffer
+        reader.read_exact(buf).await?;
+        Ok(Some(()))
     } else {
         Err(anyhow::anyhow!("Missing Content-Length header"))
     }

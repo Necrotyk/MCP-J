@@ -1,11 +1,48 @@
 
 import * as vscode from 'vscode';
 
+// Extracted for Unit Testing (Phase 50.2)
+export class RingBuffer<T> {
+    private buffer: T[] = [];
+
+    constructor(public readonly maxSize: number) { }
+
+    add(item: T) {
+        this.buffer.push(item);
+        if (this.buffer.length > this.maxSize) {
+            this.buffer.shift();
+        }
+    }
+
+    getAll(): T[] {
+        return [...this.buffer];
+    }
+
+    getLatest(): T | undefined {
+        return this.buffer[this.buffer.length - 1];
+    }
+
+    findReverse(predicate: (item: T) => boolean): T | undefined {
+        // Search from newest to oldest
+        for (let i = this.buffer.length - 1; i >= 0; i--) {
+            if (predicate(this.buffer[i])) {
+                return this.buffer[i];
+            }
+        }
+        return undefined;
+    }
+
+    clear() {
+        this.buffer = [];
+    }
+}
+
 export class SecurityPanelProvider implements vscode.WebviewViewProvider {
 
     public static readonly viewType = 'mcp-j-security';
 
     private _view?: vscode.WebviewView;
+    private _ringBuffer = new RingBuffer<any>(50);
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -19,7 +56,6 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
         this._view = webviewView;
 
         webviewView.webview.options = {
-            // Allow scripts in the webview
             enableScripts: true,
             localResourceRoots: [
                 this._extensionUri
@@ -29,15 +65,8 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
     }
 
-    private _logBuffer: any[] = [];
-    private readonly MAX_BUFFER_SIZE = 50;
-
     public addLog(entry: any) {
-        // Maintain local ring buffer for query answering
-        this._logBuffer.push(entry);
-        if (this._logBuffer.length > this.MAX_BUFFER_SIZE) {
-            this._logBuffer.shift();
-        }
+        this._ringBuffer.add(entry);
 
         if (this._view) {
             this._view.webview.postMessage({ type: 'log', entry: entry });
@@ -47,16 +76,15 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
     public getLastTelemetryEvent(): any | undefined {
         // Return latest interesting event (preferably an error or block)
         // If none, return the absolute last log
-        const reversed = [...this._logBuffer].reverse();
-        const block = reversed.find(e => {
+        const block = this._ringBuffer.findReverse(e => {
             const msg = e.message || e.fields?.message || "";
             return msg.includes("Blocked") || e.level === 'ERROR';
         });
-        return block || reversed[0];
+        return block || this._ringBuffer.getLatest();
     }
 
     public clear() {
-        this._logBuffer = [];
+        this._ringBuffer.clear();
         if (this._view) {
             this._view.webview.postMessage({ type: 'clear' });
         }

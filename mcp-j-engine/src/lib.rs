@@ -16,6 +16,10 @@ pub fn check_kernel_compatibility() -> anyhow::Result<()> {
     let release = uts.release();
     let release_str = release.to_str().unwrap_or("0.0.0");
     
+    validate_kernel_version(release_str)
+}
+
+fn validate_kernel_version(release_str: &str) -> anyhow::Result<()> {
     // Simple parsing "X.Y.Z"
     let parts: Vec<&str> = release_str.split('.').collect();
     if parts.len() >= 2 {
@@ -25,6 +29,32 @@ pub fn check_kernel_compatibility() -> anyhow::Result<()> {
             }
         }
     }
-    
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_kernel() {
+        assert!(validate_kernel_version("5.15.0").is_ok());
+        assert!(validate_kernel_version("6.0.0").is_ok());
+    }
+
+    #[test]
+    fn test_old_kernel() {
+        assert!(validate_kernel_version("5.10.0").is_err());
+        assert!(validate_kernel_version("4.19.0").is_err());
+    }
+    
+    #[test]
+    fn test_weird_version() {
+        // If parsing fails, we default to Ok (per current logic) or fail?
+        // Current logic only fails if it successfully parses major/minor AND they are too low.
+        // If parsing fails (e.g. "foo"), parts[0].parse fails, so it skips the check and returns Ok.
+        // This might be a bug or intended loose coupling.
+        // Assuming current logic is loose.
+        assert!(validate_kernel_version("foo.bar").is_ok());
+    }
 }

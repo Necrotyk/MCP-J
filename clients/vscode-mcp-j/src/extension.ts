@@ -30,7 +30,6 @@ export async function activate(context: vscode.ExtensionContext) {
         } else if (request.command === 'plan') {
             await handlePlanCommand(stream, token);
         } else if (request.command === 'configure') {
-            // Legacy alias, redirect to plan
             stream.markdown("Redirecting to workspace analysis...");
             await handlePlanCommand(stream, token);
         } else {
@@ -45,7 +44,6 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register Commands
     context.subscriptions.push(
         vscode.commands.registerCommand('mcp-j.autoConfigure', async () => {
-            // Programmatically open chat with the query
             await vscode.commands.executeCommand('workbench.action.chat.open', { query: '@mcp-j /plan' });
         }),
         vscode.commands.registerCommand('mcp-j.plan', async () => {
@@ -59,17 +57,14 @@ export async function activate(context: vscode.ExtensionContext) {
     // Phase 49: Dynamic Sandbox Configuration
     const config = vscode.workspace.getConfiguration('mcp-j');
 
-    // Startup Check: Zero-Friction Onboarding
     const autoConfigureOnOpen = config.get<boolean>('autoConfigureOnOpen') ?? true;
     if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0 && autoConfigureOnOpen) {
         const root = vscode.workspace.workspaceFolders[0].uri;
         const profileUri = vscode.Uri.joinPath(root, '.mcp-j', 'profiles', 'generic.json');
         try {
             await vscode.workspace.fs.stat(profileUri);
-            // Profile exists, start engine
             startEngine(context);
         } catch (e) {
-            // Profile does not exist
             vscode.window.showInformationMessage(
                 "MCP-J is not configured for this workspace. Analyze workspace to generate a security profile?",
                 "Analyze Workspace",
@@ -81,25 +76,19 @@ export async function activate(context: vscode.ExtensionContext) {
             });
         }
     } else {
-        // Even if no profile check, if we have configuration, try to start
-        // We only don't start if we are waiting for a profile
-        // Check if profile exists; if so, start.
         if (vscode.workspace.workspaceFolders) {
             const root = vscode.workspace.workspaceFolders[0].uri;
             const profileUri = vscode.Uri.joinPath(root, '.mcp-j', 'profiles', 'generic.json');
             try {
                 await vscode.workspace.fs.stat(profileUri);
                 startEngine(context);
-            } catch (e) {
-                // Do nothing, wait for user
-            }
+            } catch (e) { }
         }
     }
 }
 
 async function handleAuditCommand(stream: vscode.ChatResponseStream, token: vscode.CancellationToken) {
     stream.progress('Analyzing ring buffer telemetry...');
-    // Extract the last blocked event from the Ring Buffer
     const lastTrap = securityProvider.getLastTelemetryEvent();
 
     if (!lastTrap) {
@@ -133,19 +122,16 @@ async function handlePlanCommand(stream: vscode.ChatResponseStream, token: vscod
 
     const root = vscode.workspace.workspaceFolders[0].uri;
 
-    // 1. Scan Workspace
     stream.progress('Scanning workspace structure...');
     const files = await vscode.workspace.fs.readDirectory(root);
     const fileList = files.map(([name, type]) => name);
 
-    // 2. Select Model
     const [model] = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
     if (!model) {
         stream.markdown("No compatible 'gpt-4o' model found.");
         return;
     }
 
-    // 3. Send Prompt
     const prompt = `
         You are a Senior Systems Security Engineer configuring the MCP-J Secure Runtime.
         The user has a workspace with these files: ${JSON.stringify(fileList)}.
@@ -174,7 +160,6 @@ async function handlePlanCommand(stream: vscode.ChatResponseStream, token: vscod
             stream.markdown(fragment);
         }
 
-        // Logic to extract JSON
         const jsonMatch = fullText.match(/```json\s*([\s\S]*?)\s*```/) || fullText.match(/```\s*([\s\S]*?)\s*```/);
 
         if (jsonMatch) {
@@ -204,7 +189,6 @@ async function applyPendingProfile(context: vscode.ExtensionContext) {
     const root = vscode.workspace.workspaceFolders[0].uri;
 
     try {
-        // Validate JSON
         JSON.parse(pendingManifest);
 
         const profileDir = vscode.Uri.joinPath(root, '.mcp-j', 'profiles');
@@ -215,10 +199,7 @@ async function applyPendingProfile(context: vscode.ExtensionContext) {
 
         vscode.window.showInformationMessage(`Security profile applied to ${profileUri.fsPath}`);
 
-        // Start engine now that profile exists
         startEngine(context);
-
-        // Clear pending
         pendingManifest = undefined;
 
     } catch (e: any) {
@@ -228,80 +209,111 @@ async function applyPendingProfile(context: vscode.ExtensionContext) {
 
 // Refactored Engine Start Logic
 function startEngine(context: vscode.ExtensionContext) {
-    // If running, kill it first
+    terminateExistingEngine();
+
+    const config = getExtensionConfig(context);
+    const paths = resolvePaths(context, config);
+
+    outputChannel.appendLine(`Engine: ${paths.enginePath}`);
+    outputChannel.appendLine(`Profile: ${paths.manifestPath}`);
+    outputChannel.appendLine(`Log Level: ${config.logLevel.toUpperCase()}`);
+
+    try {
+        childProcess = spawnEngineProcess(paths, config);
+        attachProcessListeners(childProcess);
+    } catch (e: any) {
+        outputChannel.appendLine(`[ERROR] Setup failed: ${e.message}`);
+    }
+}
+
+function terminateExistingEngine() {
     if (childProcess) {
         outputChannel.appendLine("Restarting MCP-J Engine...");
         childProcess.kill();
         childProcess = undefined;
     }
+}
 
+interface EngineConfig {
+    rawEnginePath: string;
+    rawProfilesPath: string;
+    defaultProfile: string;
+    logLevel: string;
+    autoEphemeral: boolean;
+}
+
+function getExtensionConfig(context: vscode.ExtensionContext): EngineConfig {
     const config = vscode.workspace.getConfiguration('mcp-j');
+    return {
+        rawEnginePath: config.get<string>('enginePath') || '${extensionPath}/bin/mcp-j-cli',
+        rawProfilesPath: config.get<string>('profilesPath') || '${workspaceFolder}/.mcp-j/profiles',
+        defaultProfile: config.get<string>('defaultProfile') || 'generic.json',
+        logLevel: config.get<string>('logLevel') || 'info',
+        autoEphemeral: config.get<boolean>('autoEphemeral') ?? true
+    };
+}
 
-    const resolvePath = (p: string) => {
+interface ResolvedPaths {
+    enginePath: string;
+    manifestPath: string;
+}
+
+function resolvePaths(context: vscode.ExtensionContext, config: EngineConfig): ResolvedPaths {
+    const resolve = (p: string) => {
         return p.replace(/\$\{extensionPath\}/g, context.extensionPath)
             .replace(/\$\{workspaceFolder\}/g, vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '');
     };
 
-    const rawEnginePath = config.get<string>('enginePath') || '${extensionPath}/bin/mcp-j-cli';
-    const rawProfilesPath = config.get<string>('profilesPath') || '${workspaceFolder}/.mcp-j/profiles';
-    const defaultProfile = config.get<string>('defaultProfile') || 'generic.json';
-    const logLevel = config.get<string>('logLevel') || 'info';
-    const autoEphemeral = config.get<boolean>('autoEphemeral') ?? true;
-
+    let enginePath = resolve(config.rawEnginePath);
     // Fallback logic for dev mode
-    let enginePath = resolvePath(rawEnginePath);
-    if (context.extensionMode === vscode.ExtensionMode.Development && !rawEnginePath.includes('target')) {
+    if (context.extensionMode === vscode.ExtensionMode.Development && !config.rawEnginePath.includes('target')) {
         const devPath = path.join(context.extensionPath, '../../target/debug/mcp-j-cli');
         enginePath = devPath;
     }
 
-    const profilesPath = resolvePath(rawProfilesPath);
-    const manifestPath = path.join(profilesPath, defaultProfile);
+    const profilesPath = resolve(config.rawProfilesPath);
+    const manifestPath = path.join(profilesPath, config.defaultProfile);
 
-    outputChannel.appendLine(`Engine: ${enginePath}`);
-    outputChannel.appendLine(`Profile: ${manifestPath}`);
-    outputChannel.appendLine(`Log Level: ${logLevel.toUpperCase()}`);
+    return { enginePath, manifestPath };
+}
 
-    try {
-        const env = {
-            ...process.env,
-            RUST_LOG: logLevel,
-            MCP_J_EPHEMERAL: autoEphemeral ? "true" : "false"
-        };
-        const args = ['--manifest', manifestPath, '/usr/bin/python3'];
+function spawnEngineProcess(paths: ResolvedPaths, config: EngineConfig): cp.ChildProcess {
+    const env = {
+        ...process.env,
+        RUST_LOG: config.logLevel,
+        MCP_J_EPHEMERAL: config.autoEphemeral ? "true" : "false"
+    };
+    const args = ['--manifest', paths.manifestPath, '/usr/bin/python3'];
 
-        outputChannel.appendLine(`Spawning: ${enginePath} ${args.join(' ')}`);
+    outputChannel.appendLine(`Spawning: ${paths.enginePath} ${args.join(' ')}`);
+    return cp.spawn(paths.enginePath, args, { env });
+}
 
-        childProcess = cp.spawn(enginePath, args, { env });
-
-        if (childProcess.stderr) {
-            childProcess.stderr.on('data', (data: Buffer) => {
-                const lines = data.toString().split('\n');
-                for (const line of lines) {
-                    if (!line.trim()) continue;
-                    handleLogLine(line);
-                }
-            });
-        }
-
-        childProcess.on('error', (err: Error) => {
-            outputChannel.appendLine(`[FATAL] Spawning failed: ${err.message}`);
-            vscode.window.showErrorMessage(`MCP-J Engine failed to start: ${err.message}`);
+function attachProcessListeners(child: cp.ChildProcess) {
+    if (child.stderr) {
+        child.stderr.on('data', (data: Buffer) => {
+            const lines = data.toString().split('\n');
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                handleLogLine(line);
+            }
         });
-
-        childProcess.on('close', (code: number) => {
-            outputChannel.appendLine(`[EXIT] Process exited with code ${code}`);
-            securityProvider.addLog({
-                timestamp: new Date().toISOString(),
-                level: 'WARN',
-                message: `Process exited with code ${code}`,
-                target: 'supervisor'
-            });
-        });
-
-    } catch (e: any) {
-        outputChannel.appendLine(`[ERROR] Setup failed: ${e.message}`);
     }
+
+    child.on('error', (err: Error) => {
+        outputChannel.appendLine(`[FATAL] Spawning failed: ${err.message}`);
+        vscode.window.showErrorMessage(`MCP-J Engine failed to start: ${err.message}`);
+    });
+
+    child.on('close', (code: number) => {
+        outputChannel.appendLine(`[EXIT] Process exited with code ${code}`);
+        securityProvider.addLog({
+            timestamp: new Date().toISOString(),
+            level: 'WARN',
+            message: `Process exited with code ${code}`,
+            target: 'supervisor'
+        });
+    });
 }
 
 function handleLogLine(line: string) {
@@ -340,8 +352,6 @@ function detectThreats(log: any) {
     }
 }
 
-// Phase 66: IDE Transport Hijacking
-// Scans for .vscode/mcp.json and rewrites raw server commands to tunnel through mcp-j-cli
 async function hijackMcpConfiguration() {
     if (!vscode.workspace.workspaceFolders) return;
     const root = vscode.workspace.workspaceFolders[0].uri;
@@ -355,20 +365,11 @@ async function hijackMcpConfiguration() {
         if (config.mcpServers) {
             for (const serverName in config.mcpServers) {
                 const server = config.mcpServers[serverName];
-                // Check if command is not mcp-j-cli (and isn't our own cli already)
                 if (server.command && !server.command.includes('mcp-j-cli')) {
-                    // Hijack this server
                     const originalCmd = server.command;
                     const originalArgs = server.args || [];
 
-                    // We rewrite to use mcp-j-cli
-                    // We assume mcp-j-cli is in the PATH or use a known location.
-                    // For portability in this environment, we'll assume 'mcp-j-cli'.
                     server.command = "mcp-j-cli";
-
-                    // Prepend manifest and original command
-                    // We point to a profile specific to this server if possible, or generic. 
-                    // Prompt says "passing the appropriate workspace generic.json profile".
                     server.args = [
                         "--manifest",
                         ".mcp-j/profiles/generic.json",
@@ -383,13 +384,10 @@ async function hijackMcpConfiguration() {
         }
 
         if (modified) {
-            // Write back formatted JSON
             await vscode.workspace.fs.writeFile(mcpConfigUri, Buffer.from(JSON.stringify(config, null, 4)));
             vscode.window.showInformationMessage("MCP-J: Hijacked and hardened MCP server configurations.");
         }
     } catch (e) {
-        // Ignore if file doesn't exist or parse fails
-        // This is expected if no mcp.json exists
     }
 }
 
