@@ -253,16 +253,6 @@ impl SeccompLoop {
                      );
                  }
                  
-                 // sin.sin_addr.s_addr is already u32 in network byte order (big endian usually on network, but u32 in struct)
-                 // Rust's Ipv4Addr::from(u32) takes host byte order or network? 
-                 // Actually s_addr is just a u32. 
-                 // Ipv4Addr::from(u32) assumes host byte order if we want 1.2.3.4 to be 0x01020304?
-                 // Wait, u32::from(Ipv4Addr) returns host byte order.
-                 // s_addr is big endian (network byte order).
-                 // We should convert s_addr (BE) to native (host) u32 valid for Ipv4Addr or just compare directly.
-                 // It's safer to rely on Ipv4Addr parsing in consistent way.
-                 // let ip_raw = u32::from_be(sin.sin_addr.s_addr);
-                 
                  // The hashset stores u32::from(Ipv4Addr). Ipv4Addr "127.0.0.1" -> 0x7F000001 (Host Order).
                  // sin.sin_addr.s_addr is Network Order (Big Endian).
                  // So we need: u32::from_be(sin.sin_addr.s_addr) to match Host Order.
