@@ -58,7 +58,7 @@ impl SeccompLoop {
         let n = process_vm_readv(nix::unistd::Pid::from_raw(pid), &mut local_iov, &remote_iov)?;
         if n != len {
             // Partial read?
-            // anyhow::bail!("Partial read from tracee memory");
+            anyhow::bail!("Partial read from tracee memory: requested {}, read {}", len, n);
         }
         Ok(buf)
     }
