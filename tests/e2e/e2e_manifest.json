@@ -1,0 +1,24 @@
+{
+    "max_memory_mb": 512,
+    "allowed_egress_ips": [
+        "1.1.1.1"
+    ],
+    "allowed_egress_ipv6": [
+        "::1"
+    ],
+    "readonly_mounts": [
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/usr/lib",
+        "/lib64",
+        "/usr/lib64",
+        "/etc"
+    ],
+    "allowed_tools": [
+        "read_file"
+    ],
+    "max_cpu_quota_pct": 100,
+    "mode": "enforcing",
+    "max_ipc_payload_mb": 10
+}

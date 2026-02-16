@@ -14,10 +14,16 @@ impl Default for SecurityMode {
     }
 }
 
+fn default_ipc_limit() -> u32 {
+    10
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SandboxManifest {
     pub max_memory_mb: u64,
+    #[serde(default = "default_ipc_limit")]
+    pub max_ipc_payload_mb: u32,
     pub allowed_egress_ips: Vec<String>,
     #[serde(default)]
     pub allowed_egress_ipv6: Vec<String>,
@@ -36,6 +42,7 @@ impl Default for SandboxManifest {
     fn default() -> Self {
         Self {
             max_memory_mb: 512,
+            max_ipc_payload_mb: 10,
             allowed_egress_ips: vec!["127.0.0.1".to_string()],
             allowed_egress_ipv6: vec!["::1".to_string()],
             allowed_egress_ports: vec![80, 443], // Task 3: Default ports

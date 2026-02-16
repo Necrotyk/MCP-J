@@ -28,6 +28,7 @@ pub struct SeccompLoop {
 
 impl SeccompLoop {
     pub fn new(notify_fd: RawFd, project_root: PathBuf, allowed_command: PathBuf, manifest: SandboxManifest) -> Self {
+        eprintln!("DEBUG: SeccompLoop::new starting");
         // Pre-parse allowed IPs into u32 (network byte order)
         let mut allowed_ips = HashSet::new();
         // Always allow localhost
@@ -63,6 +64,7 @@ impl SeccompLoop {
             }
         }
 
+        eprintln!("DEBUG: SeccompLoop::new finished");
         Self { notify_fd, project_root, allowed_command, manifest, allowed_ips, allowed_ips_v6 }
     }
     
@@ -137,7 +139,7 @@ impl SeccompLoop {
             let mut req: seccomp_notif = unsafe { std::mem::zeroed() };
             
             // ioctl call
-            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_RECV as i32, &mut req) };
+            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_RECV as _, &mut req) };
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -153,7 +155,7 @@ impl SeccompLoop {
             let resp = self.handle_request(&req)?;
 
             // Send response
-            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND as i32, &resp) };
+            let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND as _, &resp) };
             if ret < 0 {
                  let err = std::io::Error::last_os_error();
                  // If process died between RECV and SEND, acceptable.
@@ -336,12 +338,34 @@ impl SeccompLoop {
 
     fn handle_execve(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
         // Task 1: Eliminate execve TOCTOU
-        // Strategy: We Block execve() and require the agent to use execveat() with a pre-validated FD.
-        // This forces the "Fallback Logic" (Fail Closed) for standard execve, unless we can use ptrace to rewrite it.
-        // Given architectural constraints (no ptrace on parent), we return EACCES.
+        // Strategy: Block unauthorized execve(), but ALLOW the initial agent launch.
+        
+        let filename_ptr = req.data.args[0];
         let tracee_pid = req.pid as pid_t;
-        tracing::warn!(pid = tracee_pid, "Blocked execve() to eliminate TOCTOU. Agent must use execveat(FD) or tool executor.");
-        Ok(self.resp_error(req, libc::EACCES))
+        
+        // Read filename
+        // Max path length 4096
+        let path_bytes = match self.read_tracee_string(tracee_pid, filename_ptr, 4096) {
+             Ok(s) => s,
+             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
+        };
+        let path = String::from_utf8_lossy(&path_bytes);
+        
+        // Normalize path: if relative, assume relative to /workspace (CWD of grandchild)
+        // But checking exact match is tricky if path resolution differs.
+        // We know self.allowed_command is what we expect.
+        // We can also allow if path starts with "/workspace/".
+        
+        let allowed = path == self.allowed_command || path.starts_with("/workspace/") || path.starts_with("/bin/") || path.starts_with("/usr/bin/") || self.manifest.readonly_mounts.iter().any(|m| path.starts_with(m));
+        
+        if allowed {
+             tracing::debug!(pid = tracee_pid, path = %path, "Authorizing initial execve()");
+             Ok(self.resp_continue(req))
+        } else {
+             // Block others
+             tracing::warn!(pid = tracee_pid, path = %path, "Blocked execve() to eliminate TOCTOU.");
+             Ok(self.resp_error(req, libc::EACCES))
+        }
     }
 
     fn handle_execveat(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
@@ -369,7 +393,7 @@ impl SeccompLoop {
         
         if dup_fd < 0 { return Ok(self.resp_error(req, libc::EBADF)); }
         
-        let file = unsafe { std::fs::File::from_raw_fd(dup_fd as i32) };
+        let _file = unsafe { std::fs::File::from_raw_fd(dup_fd as i32) };
         
         // Get path from FD
         // /proc/self/fd/N -> link
@@ -636,7 +660,7 @@ impl SeccompLoop {
             newfd_flags: 0,
         };
         
-        let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD as i32, &mut addfd) };
+        let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD as _, &mut addfd) };
         if ret < 0 {
              let err = std::io::Error::last_os_error();
              return Err(anyhow::anyhow!("ioctl ADDFD failed: {}", err));

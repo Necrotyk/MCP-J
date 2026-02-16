@@ -97,6 +97,7 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
                     .highlight-fs { color: #cca700; } /* Yellowish */
                     .highlight-rpc { color: #89d185; } /* Greenish */
                     .highlight-ipv6 { color: #569cd6; font-weight: bold; } /* Blueish for IPv6 */
+                    .highlight-execveat { color: #c586c0; font-weight: bold; border-bottom: 1px dotted #c586c0; } /* Purpleish for Process Exec */
 
                 </style>
 			</head>
@@ -161,6 +162,10 @@ export class SecurityPanelProvider implements vscode.WebviewViewProvider {
 
                         if (rawMsg.includes('IPv6')) {
                             msgSpan.classList.add('highlight-ipv6');
+                        }
+
+                        if (rawMsg.includes('execveat') || rawMsg.includes('execve')) {
+                            msgSpan.classList.add('highlight-execveat');
                         }
                         
                         div.appendChild(msgSpan);

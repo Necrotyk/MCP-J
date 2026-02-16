@@ -353,12 +353,66 @@ function detectThreats(log: any) {
 }
 
 async function hijackMcpConfiguration() {
-    if (!vscode.workspace.workspaceFolders) return;
-    const root = vscode.workspace.workspaceFolders[0].uri;
-    const mcpConfigUri = vscode.Uri.joinPath(root, '.vscode', 'mcp.json');
+    // Workspace Config
+    if (vscode.workspace.workspaceFolders) {
+        const root = vscode.workspace.workspaceFolders[0].uri;
+        const mcpConfigUri = vscode.Uri.joinPath(root, '.vscode', 'mcp.json');
+        await processConfigFile(mcpConfigUri);
+    }
 
+    // Global Config (User Settings)
+    // Note: VS Code API abstracting global settings is tricky for raw JSON edits.
+    // We typically recommend users use workspace config. 
+    // But we can check for a global mcp.json in standard locations if we knew them.
+    // Since standard MCP doesn't defined a fixed global path cross-platform effortlessly in this context,
+    // we will stick to workspace for now as per "safe" extension guidelines, 
+    // OR we can check if the user provided a global path in our extension settings.
+
+    // HOWEVER, the user asked to search "user's global settings.json".
+    // This implies VSCode's settings.json.
+    // We can inspect `vscode.workspace.getConfiguration('mcp')`?
+    // Actually, the "mcp-servers" might be defined there.
+
+    const mcpConfig = vscode.workspace.getConfiguration('mcp');
+    const servers = mcpConfig.get<any>('mcpServers');
+    if (servers) {
+        let modified = false;
+        const newServers = JSON.parse(JSON.stringify(servers)); // Deep copy
+
+        for (const serverName in newServers) {
+            const server = newServers[serverName];
+            if (server.command && !server.command.includes('mcp-j-cli')) {
+                const originalCmd = server.command;
+                const originalArgs = server.args || [];
+
+                server.command = "mcp-j-cli";
+                // We need an absolute path to profile? Or generic.
+                // For global, we might default to a bundled profile or ask user.
+                // Let's use a safe default generic profile relative to... where?
+                // We'll use the one in the workspace if available, or skip for now if no workspace.
+                if (vscode.workspace.workspaceFolders) {
+                    server.args = [
+                        "--manifest",
+                        ".mcp-j/profiles/generic.json",
+                        originalCmd,
+                        ...originalArgs
+                    ];
+                    modified = true;
+                    outputChannel.appendLine(`[Hijack] Rewrote Global MCP server '${serverName}' to use mcp-j-cli.`);
+                }
+            }
+        }
+
+        if (modified) {
+            await mcpConfig.update('mcpServers', newServers, vscode.ConfigurationTarget.Global);
+            vscode.window.showInformationMessage("MCP-J: Hijacked and hardened Global MCP server configurations.");
+        }
+    }
+}
+
+async function processConfigFile(uri: vscode.Uri) {
     try {
-        const doc = await vscode.workspace.fs.readFile(mcpConfigUri);
+        const doc = await vscode.workspace.fs.readFile(uri);
         const config = JSON.parse(doc.toString());
         let modified = false;
 
@@ -384,7 +438,7 @@ async function hijackMcpConfiguration() {
         }
 
         if (modified) {
-            await vscode.workspace.fs.writeFile(mcpConfigUri, Buffer.from(JSON.stringify(config, null, 4)));
+            await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(config, null, 4)));
             vscode.window.showInformationMessage("MCP-J: Hijacked and hardened MCP server configurations.");
         }
     } catch (e) {

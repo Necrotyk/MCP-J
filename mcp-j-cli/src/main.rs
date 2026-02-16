@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     // Extract allowed_tools before moving manifest into supervisor
     let allowed_tools = manifest.allowed_tools.clone();
 
-    let supervisor = Supervisor::new(binary, args, project_root, manifest)?;
+    let supervisor = Supervisor::new(binary, args, project_root, manifest.clone())?;
     let mut child = supervisor.spawn()?;
 
     let proxy = Arc::new(JsonRpcProxy::new(allowed_tools));
@@ -98,10 +98,15 @@ async fn main() -> anyhow::Result<()> {
     let stdin_writer = Arc::new(Mutex::new(async_child_stdin));
     let stdin_writer_clone = stdin_writer.clone();
 
+    // Clone limits for tasks
+    let manifest_limits = manifest.clone();
+    let manifest_limits_out = manifest.clone();
+
     let inbound_task = tokio::spawn(async move {
         let mut buf = Vec::with_capacity(4096);
         loop {
-            match read_lsp_message(&mut reader_in, &mut buf).await {
+            // Task 3: Dynamic limit
+            match read_lsp_message(&mut reader_in, &mut buf, manifest_limits.max_ipc_payload_mb).await {
                 Ok(Some(())) => {
                     let msg_str = match std::str::from_utf8(&buf) {
                         Ok(s) => s,
@@ -166,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
     let outbound_task = tokio::spawn(async move {
          let mut buf = Vec::with_capacity(4096);
          loop {
-            match read_lsp_message(&mut reader_out, &mut buf).await {
+            match read_lsp_message(&mut reader_out, &mut buf, manifest_limits_out.max_ipc_payload_mb).await {
                 Ok(Some(())) => {
                     let msg_str = match std::str::from_utf8(&buf) {
                         Ok(s) => s,
@@ -224,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(_) => {
                     let trim = line.trim();
                     if !trim.is_empty() {
+                         eprintln!("RAW STDERR: {}", trim);
                          tracing::warn!(source = "tracee_stderr", payload = %trim, "Stderr from child");
                     }
                 }
@@ -322,7 +328,7 @@ fn cleanup_ephemeral(pid: u32) {
     }
 }
 
-async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> anyhow::Result<Option<()>> {
+async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut Vec<u8>, max_mb: u32) -> anyhow::Result<Option<()>> {
     let mut content_length = None;
     loop {
         let mut line = String::new();
@@ -347,13 +353,14 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut 
     }
     
     if let Some(len) = content_length {
-        // Phase 53: IPC Proxy Byte Saturation Limits
-        const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10MB Limit
-        if len > MAX_PAYLOAD_SIZE {
+        // Phase 53: IPC Proxy Byte Saturation Limits (Dynamic)
+        let max_bytes: usize = (max_mb as usize) * 1024 * 1024;
+        if len > max_bytes {
             return Err(anyhow::anyhow!(
-                "Payload size {} exceeds limit of {} bytes",
+                "Payload size {} exceeds limit of {} bytes ({} MB)",
                 len,
-                MAX_PAYLOAD_SIZE
+                max_bytes,
+                max_mb
             ));
         }
 

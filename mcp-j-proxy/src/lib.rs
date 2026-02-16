@@ -25,121 +25,137 @@ impl Default for JsonRpcProxy {
 impl JsonRpcProxy {
     pub fn new(allowed_tools: Option<Vec<String>>) -> Self {
         // Task 3.2: Regex-based LLM token detection
-        let re = regex::Regex::new(r"(?i)(<\|endoftext\|>|system:|user:|\[INST\]|<\|im_start\|>)")
-            .expect("Failed to compile sanitization regex");
-        Self { allowed_tools, sanitization_regex: re }
-    }
-
-    pub fn validate_and_parse(&self, message: &str) -> Result<Value, Value> {
-        // Phase 53: IPC Proxy Byte Saturation Limits
-        const MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
-        if message.len() > MAX_PAYLOAD_BYTES {
-             let err = serde_json::json!({
-                 "jsonrpc": "2.0",
-                 "error": {
-                     "code": -32600,
-                     "message": format!("IPC_PAYLOAD_OVERFLOW: Payload exceeds maximum allowed size of {} bytes", MAX_PAYLOAD_BYTES)
-                 },
-                 "id": null
-             });
-             return Err(err);
+            // Task 1.1: Escape-Aware Filtering
+            // We use a broader regex to catch hex/unicode escapes like \u003c| or %3C|
+            // and standard tokens.
+            // Regex explanation:
+            // (?i) : Case insensitive
+            // (?: ... ) : Non-capturing group for alternatives
+            // \\u003c\| : mixed unicode escape for <|
+            // %3C\| : URL encoded <|
+            // <\|... : standard tokens
+            let re = regex::Regex::new(r"(?i)(?:\\u003c\||%3C\||<\|)(?:endoftext|im_start|im_end|system|user|assistant)|\[INST\]")
+                .expect("Failed to compile sanitization regex");
+            Self { allowed_tools, sanitization_regex: re }
         }
-
-        // 1. Strict JSON-RPC 2.0 Parsing
-        let raw: Value = match serde_json::from_str(message) {
-             Ok(v) => v,
-             Err(e) => {
-                 let err = serde_json::json!({
-                     "jsonrpc": "2.0",
-                     "error": { "code": -32700, "message": format!("Parse error: {}", e) },
-                     "id": null
-                 });
-                 return Err(err);
-             }
-        };
-        
-        // Extract ID for error reporting
-        let id = raw.get("id").cloned().unwrap_or(Value::Null);
-
-        // Check if it's a Request (has method) or Response (has result/error)
-        let is_request = raw.get("method").is_some();
-
-        if is_request {
-            // Handle Request
-            // Optimization: Consuming `raw` instead of cloning it prevents large copy.
-            let request: JsonRpcRequest = match serde_json::from_value(raw) {
-                Ok(r) => r,
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "error": { "code": -32600, "message": format!("Invalid Request: {}", e) },
-                        "id": id
-                    });
-                    return Err(err);
-                }
-            };
-
-            // Protocol Enforcement
-            if request.jsonrpc != "2.0" {
-                return Err(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -32600, "message": "Invalid JSON-RPC version" },
-                    "id": id
-                }));
-            }
-
-            // Method Validation
-            let validation_result = match request.method.as_str() {
-                "tools/call" => {
-                    if let Some(params) = &request.params {
-                        self.validate_tool_call(params)
-                    } else {
-                        Ok(())
-                    }
-                }
-                "mcp-remote/authorize" | "mcp-remote/token" => {
-                    Err("Blocked restricted method: mcp-remote/*".to_string())
-                }
-                _ => Ok(())
-            };
-
-            if let Err(msg) = validation_result {
-                 let code = if msg.contains("Tool execution blocked") { -32601 } else { -32600 };
+    
+        pub fn validate_and_parse(&self, message: &str) -> Result<Value, Value> {
+            // Phase 53: IPC Proxy Byte Saturation Limits
+            // This is currently hardcoded but will be dynamic in Task 3.
+            const MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+            if message.len() > MAX_PAYLOAD_BYTES {
                  let err = serde_json::json!({
                      "jsonrpc": "2.0",
                      "error": {
-                         "code": code,
-                         "message": format!("MCP-J SECCOMP: {}", msg)
+                         "code": -32600,
+                         "message": format!("IPC_PAYLOAD_OVERFLOW: Payload exceeds maximum allowed size of {} bytes", MAX_PAYLOAD_BYTES)
                      },
-                     "id": id
+                     "id": null
                  });
                  return Err(err);
             }
-            
-            serde_json::to_value(request).map_err(|e| {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -32603, "message": format!("Internal error during serialization: {}", e) },
-                    "id": id
-                })
-            })
-
-        } else {
-            // Handle Response (Potential Prompt Injection)
-            // Phase 68: Prompt Injection Sanitization (Egress Filter)
-            // We need to inspect 'result' for LLM control tokens.
-            if let Some(result) = raw.get("result") {
-                 let mut safe_result = result.clone();
-                 if self.recursive_sanitize(&mut safe_result) {
-                     // If sanitization occurred, synthesize a new response
-                     let mut new_raw = raw.clone();
-                     new_raw["result"] = safe_result;
-                     return Ok(new_raw);
+    
+            // 1. Strict JSON-RPC 2.0 Parsing
+            let mut raw: Value = match serde_json::from_str(message) {
+                 Ok(v) => v,
+                 Err(e) => {
+                     let err = serde_json::json!({
+                         "jsonrpc": "2.0",
+                         "error": { "code": -32700, "message": format!("Parse error: {}", e) },
+                         "id": null
+                     });
+                     return Err(err);
                  }
+            };
+            
+            // Extract ID for error reporting
+            let id = raw.get("id").cloned().unwrap_or(Value::Null);
+    
+            // Check if it's a Request (has method) or Response (has result/error)
+            let is_request = raw.get("method").is_some();
+    
+            if is_request {
+                // Task 1.2: Request Sanitization (Inbound)
+                if let Some(params) = raw.get_mut("params") {
+                    if self.recursive_sanitize(params) {
+                        // Log warning but allow modified request to proceed?
+                        // Or just silently sanitize.
+                        tracing::warn!("Sanitized inbound request params containing LLM control tokens");
+                    }
+                }
+
+                // Handle Request
+                // Optimization: Consuming `raw` instead of cloning it prevents large copy.
+                let request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let err = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "error": { "code": -32600, "message": format!("Invalid Request: {}", e) },
+                            "id": id
+                        });
+                        return Err(err);
+                    }
+                };
+    
+                // Protocol Enforcement
+                if request.jsonrpc != "2.0" {
+                    return Err(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32600, "message": "Invalid JSON-RPC version" },
+                        "id": id
+                    }));
+                }
+    
+                // Method Validation
+                let validation_result = match request.method.as_str() {
+                    "tools/call" => {
+                        if let Some(params) = &request.params {
+                            self.validate_tool_call(params)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    "mcp-remote/authorize" | "mcp-remote/token" => {
+                        Err("Blocked restricted method: mcp-remote/*".to_string())
+                    }
+                    _ => Ok(())
+                };
+    
+                if let Err(msg) = validation_result {
+                     let code = if msg.contains("Tool execution blocked") { -32601 } else { -32600 };
+                     let err = serde_json::json!({
+                         "jsonrpc": "2.0",
+                         "error": {
+                             "code": code,
+                             "message": format!("MCP-J SECCOMP: {}", msg)
+                         },
+                         "id": id
+                     });
+                     return Err(err);
+                }
+                
+                serde_json::to_value(request).map_err(|e| {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32603, "message": format!("Internal error during serialization: {}", e) },
+                        "id": id
+                    })
+                })
+    
+            } else {
+                // Handle Response (Potential Prompt Injection)
+                // Phase 68: Prompt Injection Sanitization (Egress Filter)
+                // We need to inspect 'result' for LLM control tokens.
+                if let Some(result) = raw.get_mut("result") {
+                     if self.recursive_sanitize(result) {
+                         // If sanitization occurred, return the modified raw
+                         return Ok(raw);
+                     }
+                }
+                Ok(raw)
             }
-            Ok(raw)
         }
-    }
 
     fn recursive_sanitize(&self, val: &mut Value) -> bool {
         let mut modified = false;
