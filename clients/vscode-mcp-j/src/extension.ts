@@ -1,95 +1,158 @@
+
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import * as cp from 'child_process';
+import { SecurityPanelProvider } from './securityPanel';
 
 let outputChannel: vscode.OutputChannel;
+let securityProvider: SecurityPanelProvider;
+let childProcess: cp.ChildProcess | undefined;
 
-// Phase 34: Reference IDE Client Integration
 export function activate(context: vscode.ExtensionContext) {
+    // Phase 50: Integrated Security Terminal
+    securityProvider = new SecurityPanelProvider(context.extensionUri);
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(SecurityPanelProvider.viewType, securityProvider)
+    );
+
     outputChannel = vscode.window.createOutputChannel("MCP-J Runtime");
     outputChannel.show(true);
-
     outputChannel.appendLine("MCP-J Secure Runtime Initializing...");
 
-    const command = context.extensionMode === vscode.ExtensionMode.Development
-        ? path.join(context.extensionPath, '../../target/debug/mcp-j-cli')
-        : path.join(context.extensionPath, 'bin', 'mcp-j-cli');
+    // Phase 49: Dynamic Sandbox Configuration
+    const config = vscode.workspace.getConfiguration('mcp-j');
 
-    // Default to generic profile for testing
-    // In production, this would select based on the detected agent type
-    const manifestPath = path.join(context.extensionPath, '../../profiles/generic.json');
+    // Resolve helper
+    const resolvePath = (p: string) => {
+        return p.replace(/\$\{extensionPath\}/g, context.extensionPath)
+            .replace(/\$\{workspaceFolder\}/g, vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '');
+    };
 
-    // Spawn wrapper with stderr interception
-    // Note: The SDK's StdioServerTransport abstracts the spawn, but for stderr interception
-    // we might need to implement a custom Transport or rely on the fact that
-    // mcp-j-cli already multiplexes structured logs to stderr.
-    // However, node spawn stdio handling is needed.
+    const rawEnginePath = config.get<string>('enginePath') || '${extensionPath}/bin/mcp-j-cli';
+    const rawProfilesPath = config.get<string>('profilesPath') || '${workspaceFolder}/.mcp-j/profiles';
+    const defaultProfile = config.get<string>('defaultProfile') || 'generic.json';
+    const logLevel = config.get<string>('logLevel') || 'info';
+    const autoEphemeral = config.get<boolean>('autoEphemeral') ?? true;
 
-    // For this reference implementation, we assume the SDK client connects to 
-    // the process. But the SDK usually takes a command and args.
+    // Fallback logic for dev mode
+    let enginePath = resolvePath(rawEnginePath);
+    if (context.extensionMode === vscode.ExtensionMode.Development && !rawEnginePath.includes('target')) {
+        // If in dev mode and using default path, try target/debug
+        const devPath = path.join(context.extensionPath, '../../target/debug/mcp-j-cli');
+        outputChannel.appendLine(`[DEV] Overriding engine path to: ${devPath}`);
+        enginePath = devPath;
+    }
 
-    /*
-      const transport = new StdioServerTransport({
-          command,
-          args: ["--manifest", manifestPath, "/usr/bin/python3", "-m", "mcp_host"],
-          env: { ...process.env, RUST_LOG: "info" }
-      });
-      
-      // stderr monitoring
-      // The transport object exposes the process?
-      // transport.process?.stderr?.on('data', (data) => { ... })
-    */
+    const profilesPath = resolvePath(rawProfilesPath);
+    const manifestPath = path.join(profilesPath, defaultProfile);
 
-    // To properly intercept stderr, we might extend StdioServerTransport or manual spawn.
-    // For now, we will demonstrate the integration logic.
+    // Validate if manifest exists (soft check)
+    // vscode.workspace.fs.stat(vscode.Uri.file(manifestPath)).then(...)
 
-    outputChannel.appendLine(`Target Binary: ${command}`);
-    outputChannel.appendLine(`Target Manifest: ${manifestPath}`);
+    outputChannel.appendLine(`Engine: ${enginePath}`);
+    outputChannel.appendLine(`Profile: ${manifestPath}`);
+    outputChannel.appendLine(`Log Level: ${logLevel.toUpperCase()}`);
+    outputChannel.appendLine(`Ephemeral: ${autoEphemeral}`);
 
-    // Phase 43: Client IPC Telemetry Bridge
-    // Manually spawn and bridge to SDK transport
-    const cp = require('child_process');
-    const child = cp.spawn(command, [
-        '--manifest', manifestPath,
-        '/usr/bin/python3' // Default entrypoint
-    ], {
-        env: { ...process.env, RUST_LOG: "info" }
-    });
+    // Spawn Process
+    try {
+        const env = {
+            ...process.env,
+            RUST_LOG: logLevel,
+            MCP_J_EPHEMERAL: autoEphemeral ? "true" : "false"
+        };
 
-    child.stderr.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-                const log = JSON.parse(line);
-                // Pretty print structured log to output channel
-                const level = log.level || "INFO";
-                const source = log.fields?.source || log.target || "unknown";
-                const msg = log.fields?.message || log.message || "";
+        // Use python3 as default entrypoint for demo/testing
+        // In real usage, this might be dynamic based on the task
+        const args = ['--manifest', manifestPath, '/usr/bin/python3'];
 
-                outputChannel.appendLine(`[${level}] [${source}] ${msg}`);
+        outputChannel.appendLine(`Spawning: ${enginePath} ${args.join(' ')}`);
 
-                if (log.fields?.dst_ip) {
-                    outputChannel.appendLine(`    > Forbidden Egress: ${log.fields.dst_ip}`);
+        childProcess = cp.spawn(enginePath, args, { env });
+
+        if (childProcess.stderr) {
+            childProcess.stderr.on('data', (data: Buffer) => {
+                const lines = data.toString().split('\n');
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    handleLogLine(line);
                 }
-            } catch (e) {
-                // Fallback for non-JSON stderr
-                outputChannel.appendLine(`[RAW] ${line}`);
-            }
+            });
         }
-    });
 
-    child.on('error', (err: any) => {
-        outputChannel.appendLine(`[FATAL] Process Error: ${err.message}`);
-    });
+        if (childProcess.stdout) {
+            // For now just pipe to output, later this is the JSON-RPC transport
+            childProcess.stdout.on('data', (data: Buffer) => {
+                // console.log("STDOUT:", data.toString());
+            });
+        }
 
-    child.on('close', (code: number) => {
-        outputChannel.appendLine(`[EXIT] Process exited with code ${code}`);
-    });
+        childProcess.on('error', (err: Error) => {
+            outputChannel.appendLine(`[FATAL] Spawning failed: ${err.message}`);
+            vscode.window.showErrorMessage(`MCP-J Engine failed to start: ${err.message}`);
+        });
 
-    // TODO: Connect child.stdin/stdout to MCP Client Transport
-    // const transport = new StdioClientTransport(child.stdin, child.stdout);
+        childProcess.on('close', (code: number) => {
+            outputChannel.appendLine(`[EXIT] Process exited with code ${code}`);
+            securityProvider.addLog({
+                timestamp: new Date().toISOString(),
+                level: 'WARN',
+                message: `Process exited with code ${code}`,
+                target: 'supervisor'
+            });
+        });
+
+    } catch (e: any) {
+        outputChannel.appendLine(`[ERROR] Setup failed: ${e.message}`);
+    }
 }
 
-export function deactivate() { }
+function handleLogLine(line: string) {
+    try {
+        // Attempt to parse structured JSON log
+        const log = JSON.parse(line);
+
+        // 1. Send to Security Terminal (Phase 50)
+        securityProvider.addLog(log);
+
+        // 2. Alert on High-Risk Events (Phase 51)
+        detectThreats(log);
+
+        // 3. Fallback to Output Channel
+        const level = log.level || "INFO";
+        const msg = log.message || log.fields?.message || "";
+        outputChannel.appendLine(`[${level}] ${msg}`);
+
+    } catch (e) {
+        // Not JSON - probably raw stderr panic or artifact
+        outputChannel.appendLine(`[RAW] ${line}`);
+        securityProvider.addLog({
+            timestamp: new Date().toISOString(),
+            level: 'RAW',
+            message: line,
+            target: 'stderr'
+        });
+    }
+}
+
+function detectThreats(log: any) {
+    // Logic to detect security violations
+    const isBlocked = log.message?.includes("Blocked") || log.fields?.message?.includes("Blocked");
+    const isError = log.level === 'ERROR';
+
+    if (isBlocked || isError) {
+        const msg = log.message || log.fields?.message || "Security violation detected";
+        vscode.window.showWarningMessage(`MCP-J Alert: ${msg}`, 'Open Security Log')
+            .then(selection => {
+                if (selection === 'Open Security Log') {
+                    vscode.commands.executeCommand('mcp-j-security.focus');
+                }
+            });
+    }
+}
+
+export function deactivate() {
+    if (childProcess) {
+        childProcess.kill();
+    }
+}

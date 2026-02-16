@@ -9,6 +9,61 @@
   "categories": [
     "Other"
   ],
+  "contributes": {
+    "configuration": {
+      "title": "MCP-J",
+      "properties": {
+        "mcp-j.enginePath": {
+          "type": "string",
+          "default": "${extensionPath}/bin/mcp-j-cli",
+          "description": "Path to the mcp-j-cli binary."
+        },
+        "mcp-j.profilesPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/.mcp-j/profiles",
+          "description": "Directory containing sandbox profile manifests (.json)."
+        },
+        "mcp-j.defaultProfile": {
+          "type": "string",
+          "default": "generic.json",
+          "description": "Default sandbox profile to use."
+        },
+        "mcp-j.logLevel": {
+          "type": "string",
+          "enum": [
+            "info",
+            "debug",
+            "trace"
+          ],
+          "default": "info",
+          "description": "Log level for the isolation engine."
+        },
+        "mcp-j.autoEphemeral": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable volatile overlay filesystem (ephemeral state)."
+        }
+      }
+    },
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "mcp-j-container",
+          "title": "MCP-J Security",
+          "icon": "resources/shield.svg"
+        }
+      ]
+    },
+    "views": {
+      "mcp-j-container": [
+        {
+          "id": "mcp-j-security",
+          "name": "Security Terminal",
+          "type": "webview"
+        }
+      ]
+    }
+  },
   "main": "./out/extension.js",
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -16,11 +71,14 @@
     "watch": "tsc -watch -p ./"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^0.6.0"
+    "@modelcontextprotocol/sdk": "^1.26.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.33",
-    "@types/vscode": "^1.109.0",
+    "@types/vscode": "1.90.0",
     "typescript": "^5.0.0"
-  }
+  },
+  "activationEvents": [
+    "*"
+  ]
 }
