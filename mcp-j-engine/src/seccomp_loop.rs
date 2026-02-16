@@ -32,10 +32,14 @@ impl SeccompLoop {
         // Always allow localhost
         allowed_ips.insert(0x7F000001); // 127.0.0.1
         
-        // Phase 38: DNS Resolution Entitlement (Cloudflare/Google)
-        // Explicitly allow UDP/TCP traffic to 1.1.1.1 and 8.8.8.8 for resolution
-        allowed_ips.insert(u32::from(std::net::Ipv4Addr::new(1, 1, 1, 1)));
-        allowed_ips.insert(u32::from(std::net::Ipv4Addr::new(8, 8, 8, 8)));
+        // Task 2.2: DNS Manifest Integration
+        for resolver in &manifest.allowed_dns_resolvers {
+            if let Ok(ip) = resolver.parse::<std::net::Ipv4Addr>() {
+                 allowed_ips.insert(u32::from(ip));
+            } else {
+                 tracing::warn!(resolver = %resolver, "Failed to parse allowed DNS resolver IP");
+            }
+        }
         
         for ip_str in &manifest.allowed_egress_ips {
             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
@@ -47,7 +51,7 @@ impl SeccompLoop {
     
         Self { notify_fd, project_root, allowed_command, manifest, allowed_ips }
     }
-
+    
     // Helper to read memory from the tracee
     fn read_tracee_memory(&self, pid: pid_t, addr: u64, len: usize) -> Result<Vec<u8>> {
         
@@ -70,6 +74,7 @@ impl SeccompLoop {
         let page_size = 4096;
         let mut current_addr = addr as usize;
         
+        // Task 2.3: Robust memory reading loop
         loop {
             if path_buf.len() >= max_len {
                 return Err(anyhow::anyhow!("Path too long"));
@@ -85,14 +90,14 @@ impl SeccompLoop {
             
             let n = match process_vm_readv(nix::unistd::Pid::from_raw(pid), &mut local_iov, &remote_iov) {
                 Ok(n) => n,
-                Err(_) => {
-                    if path_buf.is_empty() { return Err(anyhow::anyhow!("Failed to read memory")); }
-                    0 
+                Err(e) => {
+                    // Fail hard on EFAULT/errors if we haven't found a null terminator yet
+                    return Err(anyhow::anyhow!("EFAULT during path read: {}", e));
                 }
             };
             
-            if n == 0 && path_buf.is_empty() {
-                return Err(anyhow::anyhow!("Failed to read memory, 0 bytes"));
+            if n == 0 {
+                return Err(anyhow::anyhow!("Unexpected 0-byte read (EOF)"));
             }
             
             let read_slice = &buf[..n];
@@ -102,14 +107,9 @@ impl SeccompLoop {
             } else {
                 path_buf.extend_from_slice(read_slice);
                 current_addr += n;
-                if n < chunk_size {
-                    // Partial read (EOF/EFAULT on remote?)
-                    return Err(anyhow::anyhow!("Path not null terminated within readable memory"));
-                }
             }
         }
         
-        // No UTF-8 validation here (Phase 16)
         Ok(path_buf)
     }
 

@@ -20,15 +20,19 @@ pub fn check_kernel_compatibility() -> anyhow::Result<()> {
 }
 
 fn validate_kernel_version(release_str: &str) -> anyhow::Result<()> {
-    // Simple parsing "X.Y.Z"
+    // Task 4.1: Return Error if version string is unparseable
     let parts: Vec<&str> = release_str.split('.').collect();
-    if parts.len() >= 2 {
-        if let (Ok(major), Ok(minor)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-            if major < 5 || (major == 5 && minor < 14) {
-                 anyhow::bail!("Kernel too old: {}. Need 5.14+ for full isolation support.", release_str);
-            }
-        }
+    if parts.len() < 2 {
+        anyhow::bail!("Unparseable kernel version string: {}", release_str);
     }
+    
+    let major = parts[0].parse::<u32>().map_err(|_| anyhow::anyhow!("Invalid kernel major version: {}", parts[0]))?;
+    let minor = parts[1].parse::<u32>().map_err(|_| anyhow::anyhow!("Invalid kernel minor version: {}", parts[1]))?;
+
+    if major < 5 || (major == 5 && minor < 14) {
+         anyhow::bail!("Kernel too old: {}. Need 5.14+ for full isolation support.", release_str);
+    }
+    
     Ok(())
 }
 

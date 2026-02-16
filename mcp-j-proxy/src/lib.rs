@@ -4,6 +4,7 @@ use serde_json::Value;
 #[derive(Clone)]
 pub struct JsonRpcProxy {
     allowed_tools: Option<Vec<String>>,
+    sanitization_regex: regex::Regex,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -23,7 +24,10 @@ impl Default for JsonRpcProxy {
 
 impl JsonRpcProxy {
     pub fn new(allowed_tools: Option<Vec<String>>) -> Self {
-        Self { allowed_tools }
+        // Task 3.2: Regex-based LLM token detection
+        let re = regex::Regex::new(r"(?i)(<\|endoftext\|>|system:|user:|\[INST\]|<\|im_start\|>)")
+            .expect("Failed to compile sanitization regex");
+        Self { allowed_tools, sanitization_regex: re }
     }
 
     pub fn validate_and_parse(&self, message: &str) -> Result<Value, Value> {
@@ -141,17 +145,18 @@ impl JsonRpcProxy {
         let mut modified = false;
         match val {
             Value::String(s) => {
-                let targets = ["<|im_start|>", "[INST]", "\nSystem:"];
-                for target in targets {
-                    if s.contains(target) {
-                        // Sanitization: Replace <| with &lt;| to break the token
-                        *s = s.replace("<|", "&lt;|")
-                              .replace("[INST]", "[SANITIZED_INST]")
-                              .replace("\nSystem:", "\n[SANITIZED_SYS]:");
-                        
-                        eprintln!("[PROMPT_INJECTION_ATTEMPT] Detected and neutralized LLM control token: {}", target);
-                        modified = true;
-                    }
+                // Task 3.2: Regex-based sanitization
+                if self.sanitization_regex.is_match(s) {
+                    let sanitized = self.sanitization_regex.replace_all(s, |caps: &regex::Captures| {
+                        let m = &caps[0];
+                        // Replace <| with &lt;| to break tokens, obscure others
+                        m.replace("<|", "&lt;|")
+                         .replace("[", "&#91;")
+                         .replace(":", "&#58;")
+                    });
+                    *s = sanitized.into_owned();
+                    eprintln!("[PROMPT_INJECTION_ATTEMPT] Detected and neutralized LLM control tokens");
+                    modified = true;
                 }
             }
             Value::Array(arr) => {
@@ -205,8 +210,9 @@ impl JsonRpcProxy {
         match args {
             Value::String(s) => {
                 // Phase 4: CVE-2025-6514 Shell Metacharacter Scrubbing
-                // Reject sequences: $(, `, |, ;, &&, ||, >
-                let forbidden = ["$(", "`", "||", "&&", "|", ";", ">"];
+                // Task 3.1: Expand forbidden list
+                // Reject sequences: $(, `, |, ;, &&, ||, >, \n, \r, {, }, [
+                let forbidden = ["$(", "`", "||", "&&", "|", ";", ">", "\n", "\r", "{", "}", "["];
                 for pattern in forbidden {
                     if s.contains(pattern) {
                          return Err(format!("Argument contains forbidden shell metacharacter sequence '{}'", pattern));

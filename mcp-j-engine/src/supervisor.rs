@@ -147,6 +147,13 @@ impl Supervisor {
     }
 
     fn handle_child(self, child_sock: OwnedFd, pipes: Pipes) -> Result<()> {
+        // Enforce NoNewPrivs (Phase 1.3)
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(anyhow::anyhow!("Failed to set NO_NEW_PRIVS"));
+            }
+        }
+
         // Redirect stdio
         let _ = unistd::dup2(pipes.stdin_read.as_raw_fd(), 0);
         let _ = unistd::dup2(pipes.stdout_write.as_raw_fd(), 1);
@@ -208,25 +215,45 @@ impl Supervisor {
         let cgroup_path = guard.path().clone();
         
         if let Err(e) = std::fs::create_dir(&cgroup_path) {
-             tracing::warn!(path = ?cgroup_path, error = %e, "Failed to create cgroup. Resource limits might not be applied.");
-             return Ok(());
+             let msg = format!("Failed to create cgroup {}: {}", cgroup_path.display(), e);
+             if self.manifest.mode == crate::manifest::SecurityMode::Enforcing {
+                 anyhow::bail!(msg);
+             } else {
+                 tracing::warn!("{}", msg);
+                 return Ok(());
+             }
         }
         
         // Add self
         if let Err(e) = std::fs::write(cgroup_path.join("cgroup.procs"), pid.to_string()) {
-             tracing::warn!(error = %e, "Failed to add pid to cgroup");
+             let msg = format!("Failed to add pid to cgroup: {}", e);
+             if self.manifest.mode == crate::manifest::SecurityMode::Enforcing {
+                 anyhow::bail!(msg);
+             } else {
+                 tracing::warn!("{}", msg);
+             }
         }
         
         let mem_bytes = self.manifest.max_memory_mb * 1024 * 1024;
         if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), mem_bytes.to_string()) {
-             tracing::warn!(error = %e, "Failed to set memory limit");
+             let msg = format!("Failed to set memory limit: {}", e);
+             if self.manifest.mode == crate::manifest::SecurityMode::Enforcing {
+                 anyhow::bail!(msg);
+             } else {
+                 tracing::warn!("{}", msg);
+             }
         }
         
         if self.manifest.max_cpu_quota_pct > 0 {
              let quota = self.manifest.max_cpu_quota_pct * 1000;
              let val = format!("{} 100000", quota);
              if let Err(e) = std::fs::write(cgroup_path.join("cpu.max"), val) {
-                  tracing::warn!(error = %e, "Failed to set cpu limit");
+                  let msg = format!("Failed to set cpu limit: {}", e);
+                  if self.manifest.mode == crate::manifest::SecurityMode::Enforcing {
+                      anyhow::bail!(msg);
+                  } else {
+                       tracing::warn!("{}", msg);
+                  }
              }
         }
         Ok(())
@@ -254,9 +281,11 @@ impl Supervisor {
         if !workspace_path.exists() { std::fs::create_dir(&workspace_path)?; }
         
         // Ephemeral OverlayFS (Phase 41)
-        let pid = std::process::id();
-        let upper_dir = std::path::PathBuf::from(format!("/tmp/mcp_upper_{}", pid));
-        let work_dir = std::path::PathBuf::from(format!("/tmp/mcp_work_{}", pid));
+        // Task 1.1: Use std::env::temp_dir() and UUID
+        let temp_dir = std::env::temp_dir();
+        let uuid = uuid::Uuid::new_v4().simple().to_string();
+        let upper_dir = temp_dir.join(format!("mcp_upper_{}", uuid));
+        let work_dir = temp_dir.join(format!("mcp_work_{}", uuid));
         if !upper_dir.exists() { std::fs::create_dir(&upper_dir)?; }
         if !work_dir.exists() { std::fs::create_dir(&work_dir)?; }
         

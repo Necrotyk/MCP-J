@@ -1,5 +1,5 @@
 use landlock::{
-    Access, AccessFs, Ruleset, ABI, RulesetStatus, RulesetAttr, RulesetCreatedAttr,
+    Access, AccessFs, AccessNet, Ruleset, ABI, RulesetStatus, RulesetAttr, RulesetCreatedAttr,
     PathBeneath
 };
 use std::collections::HashMap;
@@ -27,7 +27,8 @@ impl LandlockRuleset {
     }
 
     pub fn allow_write<P: Into<PathBuf>>(&mut self, path: P) -> &mut Self {
-        let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute | AccessFs::WriteFile | AccessFs::RemoveDir | AccessFs::RemoveFile | AccessFs::MakeChar | AccessFs::MakeDir | AccessFs::MakeReg | AccessFs::MakeSock | AccessFs::MakeFifo | AccessFs::MakeBlock | AccessFs::MakeSym;
+        // Task 2.1: Include Truncate (will be filtered later if not supported)
+        let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute | AccessFs::WriteFile | AccessFs::RemoveDir | AccessFs::RemoveFile | AccessFs::MakeChar | AccessFs::MakeDir | AccessFs::MakeReg | AccessFs::MakeSock | AccessFs::MakeFifo | AccessFs::MakeBlock | AccessFs::MakeSym | AccessFs::Truncate;
         let mut p: PathBuf = path.into();
         self.allowed_paths.insert(p, access);
         self
@@ -35,30 +36,48 @@ impl LandlockRuleset {
 
 
     pub fn apply(&self) -> Result<()> {
-        // Phase 31: Dynamic LSM ABI Negotiation
-        // Use default() which probes V1
-        let abi = ABI::V1; 
-        
-        // Attempt to upgrade to best supported if possible? 
-        // Actually, just using V1 is safest for broad compatibility if we only need V1 features.
-        // But if we want max protection, we should check.
-        // The landlock crate's ABI enum usually has V1, V2, V3 etc.
-        // `AccessFs::from_all(abi)` will return access rights supported by that ABI.
-        
-        let mut ruleset = Ruleset::default()
-            .handle_access(AccessFs::from_all(abi))?
-            .create()?;
+        // Task 2.1: Dynamic Landlock ABI Probing
+        // Probe for highest supported ABI (checking V4 down to V1)
+        let supported_abi = [ABI::V4, ABI::V3, ABI::V2, ABI::V1]
+            .into_iter()
+            .find(|&abi| {
+                // Check if we can create a ruleset with this ABI's FS flags
+                // This is a rough check. Ideally we check IsSupported or similar but creating ruleset is definitive.
+                Ruleset::new().handle_access(AccessFs::from_all(abi)).create().is_ok()
+            })
+            .unwrap_or(ABI::V1);
+
+        tracing::info!("Detected Landlock ABI version: {:?}", supported_abi);
+
+        let mut builder = Ruleset::new()
+            .handle_access(AccessFs::from_all(supported_abi))?;
+            
+        // If V4, enable network restrictions (Fail-Closed)
+        // We catch error in case kernel supports V4 FS but implies something else for Net? 
+        // ABI::V4 implies Net support.
+        if supported_abi >= ABI::V4 {
+             builder = builder.handle_access(AccessNet::from_all(supported_abi))?;
+        }
+
+        let mut ruleset = builder.create()?;
 
         for (path, access) in &self.allowed_paths {
              if !path.exists() {
                  continue;
              }
              
-             // Open the path to get an FD (AsFd)
+             // Open the path to get an FD
              let file = std::fs::File::open(path)
                  .map_err(|e| anyhow::anyhow!("Failed to open path for landlock {:?}: {}", path, e))?;
                  
-             let rule = PathBeneath::new(&file, *access);
+             // Filter access flags based on supported ABI
+             let supported_access = *access & AccessFs::from_all(supported_abi);
+             
+             if supported_access.is_empty() {
+                 continue;
+             }
+
+             let rule = PathBeneath::new(&file, supported_access);
              
              ruleset = ruleset.add_rule(rule)
                  .map_err(|e| anyhow::anyhow!("Failed to add Landlock rule for {:?}: {}", path, e))?;

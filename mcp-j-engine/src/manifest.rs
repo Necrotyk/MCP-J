@@ -22,6 +22,8 @@ pub struct SandboxManifest {
     pub readonly_mounts: Vec<String>,
     pub env_vars: HashMap<String, String>,
     pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_dns_resolvers: Vec<String>,
     pub max_cpu_quota_pct: u32,
     pub mode: SecurityMode,
 }
@@ -44,6 +46,7 @@ impl Default for SandboxManifest {
                 "read_file".to_string(),
                 "list_directory".to_string(),
             ]),
+            allowed_dns_resolvers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             max_cpu_quota_pct: 100,
             mode: SecurityMode::Enforcing,
         }
