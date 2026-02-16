@@ -81,7 +81,6 @@
         "name": "mcp-j",
         "description": "Query kernel traps and security boundaries.",
         "isSticky": true,
-        "welcomeMessage": "Welcome! I can help you audit security events or configure your workspace. [Analyze Workspace](command:mcp-j.plan)",
         "commands": [
           {
             "name": "audit",
@@ -139,5 +138,8 @@
     "url": "https://github.com/Necrotyk/MCP-J.git"
   },
   "license": "MIT",
-  "publisher": "dystopi-research"
+  "publisher": "dystopi-research",
+  "activationEvents": [
+    "onStartupFinished"
+  ]
 }
