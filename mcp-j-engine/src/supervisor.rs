@@ -354,11 +354,11 @@ impl Supervisor {
         if !workspace_path.exists() { std::fs::create_dir(&workspace_path).context("Failed to create workspace_path")?; }
         
         // Ephemeral OverlayFS (Phase 41)
-        // Task 1.1: Use std::env::temp_dir() and UUID
+        // Task 1.1: Use std::env::temp_dir() and PID (as expected by cleanup_ephemeral)
         let temp_dir = std::env::temp_dir();
-        let uuid = uuid::Uuid::new_v4().simple().to_string();
-        let upper_dir = temp_dir.join(format!("mcp_upper_{}", uuid));
-        let work_dir = temp_dir.join(format!("mcp_work_{}", uuid));
+        let pid = std::process::id(); // Use the intermediate process ID
+        let upper_dir = temp_dir.join(format!("mcp_upper_{}", pid));
+        let work_dir = temp_dir.join(format!("mcp_work_{}", pid));
         if !upper_dir.exists() { std::fs::create_dir(&upper_dir).context("Failed into create upper_dir")?; }
         if !work_dir.exists() { std::fs::create_dir(&work_dir).context("Failed to create work_dir")?; }
         

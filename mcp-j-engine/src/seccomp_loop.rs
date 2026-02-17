@@ -394,6 +394,18 @@ impl SeccompLoop {
              tracing::warn!(pid = tracee_pid, "Blocked execveat() without AT_EMPTY_PATH (TOCTOU risk)");
              return Ok(self.resp_error(req, libc::EACCES));
         }
+
+        // Verify path is actually empty (Linux kernel should enforce this with AT_EMPTY_PATH, but we double check)
+        if req.data.args[1] != 0 {
+             let path_bytes = self.read_path_tracee(tracee_pid, req.data.args[1]).unwrap_or_default();
+             // Check if it contains anything other than null.
+             // read_path_tracee stops at null or max length.
+             if !path_bytes.is_empty() && path_bytes != b"\0" {
+                 // If using AT_EMPTY_PATH, path should be ""
+                 tracing::warn!(pid = tracee_pid, "Blocked execveat() with non-empty path bypass");
+                 return Ok(self.resp_error(req, libc::EACCES));
+             }
+        }
         
         // Resolve FD from tracee
         // We need to verify if the file pointed to by dirfd is allowed.
@@ -651,7 +663,11 @@ impl SeccompLoop {
              let fd = root_handle.as_raw_fd();
              let fd_link = format!("/proc/self/fd/{}", fd);
              if let Ok(root_path) = std::fs::read_link(&fd_link) {
-                  let is_system = self.manifest.readonly_mounts.iter().any(|prefix| root_path.starts_with(prefix));
+                  let root_path_str = root_path.to_string_lossy();
+                  let is_system = self.manifest.readonly_mounts.iter().any(|prefix| {
+                       let jail_prefix = format!("/tmp/jail_root{}", prefix);
+                       root_path_str.starts_with(&jail_prefix) || root_path_str.starts_with(prefix)
+                  });
                   if is_system {
                        tracing::warn!(pid = tracee_pid, root = ?root_path, "Blocked write access to system mount via dirfd");
                        return Ok(self.resp_error(req, libc::EACCES));
@@ -765,7 +781,11 @@ impl SeccompLoop {
                let fd = root_handle.as_raw_fd();
                let fd_link = format!("/proc/self/fd/{}", fd);
                if let Ok(root_path) = std::fs::read_link(&fd_link) {
-                    let is_system = self.manifest.readonly_mounts.iter().any(|prefix| root_path.starts_with(prefix));
+                    let root_path_str = root_path.to_string_lossy();
+                    let is_system = self.manifest.readonly_mounts.iter().any(|prefix| {
+                        let jail_prefix = format!("/tmp/jail_root{}", prefix);
+                        root_path_str.starts_with(&jail_prefix) || root_path_str.starts_with(prefix)
+                    });
                     if is_system {
                          tracing::warn!(pid = tracee_pid, root = ?root_path, "Blocked write access to system mount via cwd");
                          return Ok(self.resp_error(req, libc::EACCES));

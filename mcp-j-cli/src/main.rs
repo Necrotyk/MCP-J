@@ -126,14 +126,10 @@ async fn main() -> anyhow::Result<()> {
                                      continue;
                                  }
                              };
-                             let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
+                             let payload = format!("Content-Length: {}\r\n\r\n{}", serialized.len(), serialized);
                              
-                             if let Err(e) = child_stdin.write_all(header.as_bytes()).await {
-                                 tracing::error!(error = %e, "Failed to write header to child stdin");
-                                 break;
-                             }
-                             if let Err(e) = child_stdin.write_all(serialized.as_bytes()).await {
-                                 tracing::error!(error = %e, "Failed to write body to child stdin");
+                             if let Err(e) = child_stdin.write_all(payload.as_bytes()).await {
+                                 tracing::error!(error = %e, "Failed to write payload to child stdin");
                                  break;
                              }
                              let _ = child_stdin.flush().await;
@@ -146,10 +142,9 @@ async fn main() -> anyhow::Result<()> {
                                      continue;
                                  }
                              };
-                             let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
+                             let payload = format!("Content-Length: {}\r\n\r\n{}", serialized.len(), serialized);
                              let mut stdout = tokio::io::stdout();
-                             let _ = stdout.write_all(header.as_bytes()).await;
-                             let _ = stdout.write_all(serialized.as_bytes()).await;
+                             let _ = stdout.write_all(payload.as_bytes()).await;
                              let _ = stdout.flush().await;
                         }
                     }
@@ -190,15 +185,11 @@ async fn main() -> anyhow::Result<()> {
                                      continue;
                                  }
                              };
-                             let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
+                             let payload = format!("Content-Length: {}\r\n\r\n{}", serialized.len(), serialized);
                              
                              let mut stdout = tokio::io::stdout();
-                             if let Err(e) = stdout.write_all(header.as_bytes()).await {
-                                 tracing::error!(error = %e, "Failed to write header to host stdout");
-                                 break;
-                             }
-                             if let Err(e) = stdout.write_all(serialized.as_bytes()).await {
-                                 tracing::error!(error = %e, "Failed to write body to host stdout");
+                             if let Err(e) = stdout.write_all(payload.as_bytes()).await {
+                                 tracing::error!(error = %e, "Failed to write payload to host stdout");
                                  break;
                              }
                              let _ = stdout.flush().await;
