@@ -86,7 +86,9 @@ impl JsonRpcProxy {
 
                 // Handle Request
                 // Optimization: Consuming `raw` instead of cloning it prevents large copy.
-                let request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
+                // Handle Request
+                // Optimization: Consuming `raw` instead of cloning it prevents large copy.
+                let mut request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
                     Ok(r) => r,
                     Err(e) => {
                         let err = serde_json::json!({
@@ -110,7 +112,7 @@ impl JsonRpcProxy {
                 // Method Validation
                 let validation_result = match request.method.as_str() {
                     "tools/call" => {
-                        if let Some(params) = &request.params {
+                        if let Some(params) = &mut request.params {
                             self.validate_tool_call(params)
                         } else {
                             Ok(())
@@ -190,34 +192,34 @@ impl JsonRpcProxy {
         modified
     }
 
-    fn validate_tool_call(&self, params: &Value) -> Result<(), String> {
-        let params_obj = params.as_object()
+    fn validate_tool_call(&self, params: &mut Value) -> Result<(), String> {
+        let params_obj = params.as_object_mut()
             .ok_or_else(|| "Invalid params structure for tools/call".to_string())?;
 
         let name = params_obj.get("name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Invalid params structure for tools/call".to_string())?;
+            .ok_or_else(|| "Invalid params structure for tools/call".to_string())?
+            .to_string(); // Clone name to avoid borrow issues
 
         // Phase 67: Protocol-Aware Tool Filtering
         if let Some(allowed) = &self.allowed_tools {
-            if !allowed.iter().any(|s| s == name) {
+            if !allowed.iter().any(|s| s == &name) {
                 return Err(format!("Tool execution blocked by Layer 7 policy: '{}'", name));
             }
         }
 
-        if let Some(args) = params_obj.get("arguments") {
+        if let Some(args) = params_obj.get_mut("arguments") {
             // Task 4.2: Schema Enforcement
-            self.validate_tool_schema(name, args)?;
+            self.validate_tool_schema(&name, args)?;
             
-            // Task 1: Schema-Aware Validation
-            // If the tool schema is strictly validated (like read_file path), 
-            // we can skip the shell-sensitive deep inspection for those known tools.
-            // This prevents false positives on valid paths that might look like shell args.
-            match name {
+            // Task 1: Schema-Aware Validation & Quoting
+            match name.as_str() {
                 "read_file" | "list_directory" => {
-                    // Implicitly trusted because we use File::open directly (no shell)
+                    // Already validated by schema (regex check)
                 },
                 _ => {
+                    // For unknown/generic tools, we conservatively quote strings
+                    // to prevent shell injection if they are used in shells.
                     self.validate_arguments(args, 0)?;
                 }
             }
@@ -227,46 +229,41 @@ impl JsonRpcProxy {
 
     fn validate_tool_schema(&self, name: &str, args: &Value) -> Result<(), String> {
         let args_obj = args.as_object().ok_or("Arguments must be an object")?;
+        // Task B-3: Strict Regex for paths
+        let path_regex = regex::Regex::new(r"^[\w\-. /]+$").unwrap();
         
         match name {
             "read_file" => {
                 if !args_obj.contains_key("path") { return Err("Missing 'path' argument".into()); }
-                if !args_obj["path"].is_string() { return Err("'path' must be a string".into()); }
+                let p = args_obj["path"].as_str().ok_or("'path' must be a string")?;
+                if !path_regex.is_match(p) { return Err("Invalid 'path': Must match ^[\\w\\-. /]+$".into()); }
                 if args_obj.len() != 1 { return Err("Unexpected arguments for read_file".into()); }
             },
             "list_directory" => {
                  if !args_obj.contains_key("path") { return Err("Missing 'path' argument".into()); }
-                 if !args_obj["path"].is_string() { return Err("'path' must be a string".into()); }
+                 let p = args_obj["path"].as_str().ok_or("'path' must be a string")?;
+                 if !path_regex.is_match(p) { return Err("Invalid 'path': Must match ^[\\w\\-. /]+$".into()); }
                  if args_obj.len() != 1 { return Err("Unexpected arguments for list_directory".into()); }
             },
-            // For unknown tools, we rely on validate_arguments (deny-list)
             _ => {}
         }
         Ok(())
     }
 
-    fn validate_arguments(&self, args: &Value, depth: usize) -> Result<(), String> {
+    fn validate_arguments(&self, args: &mut Value, depth: usize) -> Result<(), String> {
         const MAX_RECURSION_DEPTH: usize = 128;
         if depth > MAX_RECURSION_DEPTH {
             return Err(format!("Recursion limit exceeded at depth {}", depth));
         }
 
-        // Validation logic for user-space (proxy) has been simplified.
-        // We rely on kernel-level enforcement (Landlock, Seccomp) for security.
-        // The proxy mainly ensures structural integrity of JSON-RPC 2.0.
-        // Deep inspection of string arguments for shell injection is prone to false positives
-        // with legitimate code artifacts (e.g. bash scripts, markdown).
-        
         match args {
             Value::String(s) => {
-                // Task 4.1: Shell-Metacharacter-Deny-List
-                // Replaces the aggressive whitelist. We block specific characters that 
-                // trigger shell execution/redirection/expansion.
-                // Block: | ; & $ > < ` \
-                // We allow: " ' ( ) { } , * ? [ ] etc.
-                let deny_re = regex::Regex::new(r"[|;&$><`\\]").unwrap();
-                if deny_re.is_match(s) {
-                     return Err(format!("Argument contains forbidden shell metacharacter: '{}'", s));
+                // Task B-3: Enforce shlex::try_quote
+                // We strictly quote ALL free-text arguments for unknown tools.
+                // This ensures that even if they are passed to a shell, they are treated as literals.
+                match shlex::try_quote(s) {
+                    Ok(quoted) => *s = quoted.into_owned(),
+                    Err(_) => return Err("Argument contains null byte, cannot be quoted".to_string()),
                 }
             }
             Value::Array(arr) => {
@@ -378,15 +375,30 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_injection_prevention() {
+    fn test_shell_injection_mitigation() {
         let allowed = Some(vec!["safe_tool".to_string()]);
         let proxy = JsonRpcProxy::new(allowed);
         // Test with pipe character |
         let msg = r#"{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "safe_tool", "arguments": {"cmd": "ls | rm -rf /"}}, "id": 1}"#;
         let res = proxy.validate_and_parse(msg);
+        assert!(res.is_ok()); // Should succeed with quoting
+        let val = res.unwrap();
+        // Check if argument was quoted
+        let cmd = val["params"]["arguments"]["cmd"].as_str().unwrap();
+        // shlex::quote("ls | rm -rf /") -> "'ls | rm -rf /'"
+        assert_eq!(cmd, "'ls | rm -rf /'");
+    }
+
+    #[test]
+    fn test_read_file_path_validation() {
+        let allowed = Some(vec!["read_file".to_string()]);
+        let proxy = JsonRpcProxy::new(allowed);
+        // Test with path traversal/unsafe chars
+        let msg = r#"{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "read_file", "arguments": {"path": "/etc/passwd; ls"}}, "id": 1}"#;
+        let res = proxy.validate_and_parse(msg);
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(err["error"]["message"].as_str().unwrap().contains("forbidden shell metacharacter"));
+        assert!(err["error"]["message"].as_str().unwrap().contains("Invalid 'path'"));
     }
 
     #[test]

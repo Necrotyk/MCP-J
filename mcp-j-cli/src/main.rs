@@ -320,45 +320,78 @@ fn cleanup_ephemeral(pid: u32) {
 }
 
 async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut Vec<u8>, max_mb: u32) -> anyhow::Result<Option<()>> {
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => return Ok(None),
-            Ok(_) => {
-                 if line == "\r\n" || line == "\n" {
-                     break;
-                 }
-                 
-                 let lower = line.to_lowercase();
-                 if lower.starts_with("content-length:") {
-                     if let Some(val) = lower.strip_prefix("content-length:") {
-                         if let Ok(len) = val.trim().parse::<usize>() {
-                             content_length = Some(len);
-                         }
-                     }
-                 }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+    // Task 4: Harden LSP Reader (DoS Protection)
+    // Enforce hard timeout on header reads
+    let timeout_duration = std::time::Duration::from_secs(5);
     
-    if let Some(len) = content_length {
-        // Phase 53: IPC Proxy Byte Saturation Limits (Dynamic)
-        let max_bytes: usize = (max_mb as usize) * 1024 * 1024;
-        if len > max_bytes {
-            return Err(anyhow::anyhow!(
-                "Payload size {} exceeds limit of {} bytes ({} MB)",
-                len,
-                max_bytes,
-                max_mb
-            ));
-        }
+    let content_length = tokio::time::timeout(timeout_duration, async {
+        let mut content_length = None;
+        let mut header_bytes_read = 0;
+        const MAX_HEADER_SIZE: usize = 4096; // 4KB limit for all headers
+        
+        loop {
+            let mut line = String::new();
+            
+            // Safe read_line equivalent that respects limits
+            loop {
+                let b = match reader.read_u8().await {
+                    Ok(b) => b,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // EOF during header read
+                         if header_bytes_read == 0 { return Ok(None); } 
+                         return Err(anyhow::anyhow!("Unexpected EOF in headers"));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                
+                header_bytes_read += 1;
+                if header_bytes_read > MAX_HEADER_SIZE {
+                    return Err(anyhow::anyhow!("Header size exceeded limit"));
+                }
+                
+                line.push(b as char);
+                if line.ends_with('\n') {
+                    break;
+                }
+            }
 
-        buf.resize(len, 0); // Reuse buffer
-        reader.read_exact(buf).await?;
-        Ok(Some(()))
-    } else {
-        Err(anyhow::anyhow!("Missing Content-Length header"))
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                // End of headers (\r\n\r\n or \n\n)
+                return Ok(content_length);
+            }
+            
+            let lower = trimmed.to_lowercase();
+            if lower.starts_with("content-length:") {
+                if let Some(val) = lower.strip_prefix("content-length:") {
+                    if let Ok(len) = val.trim().parse::<usize>() {
+                        content_length = Some(len);
+                    }
+                }
+            }
+        }
+    }).await.map_err(|_| anyhow::anyhow!("Header read timeout"))??;
+    
+    // Check if we got EOF (None) from the inner loop
+    let len = match content_length {
+        Some(l) => l,
+        None => return Ok(None), // EOF at start
+    };
+
+    // Phase 53: IPC Proxy Byte Saturation Limits (Dynamic)
+    let max_bytes: usize = (max_mb as usize) * 1024 * 1024;
+    if len > max_bytes {
+        return Err(anyhow::anyhow!(
+            "Payload size {} exceeds limit of {} bytes ({} MB)",
+            len,
+            max_bytes,
+            max_mb
+        ));
     }
+
+    buf.resize(len, 0); // Reuse buffer
+    // For body read, we also want a timeout per byte? Or strict timeout for whole body?
+    // User only asked for timeout on header reads.
+    reader.read_exact(buf).await?;
+    Ok(Some(()))
 }

@@ -303,34 +303,28 @@ impl SeccompLoop {
                      );
                  }
                  
-                 // Handle IPv4-Mapped IPv6 (::ffff:1.2.3.4)
-                 let raw_ip = u128::from_be_bytes(sin6.sin6_addr.s6_addr);
+                 let ipv6_addr = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
                  
-                 // Check valid IPv4 mapped prefix: ::ffff:0:0/96
-                 if (raw_ip >> 32) == 0x0000_0000_0000_0000_0000_FFFF {
-                     // Extract IPv4 part
-                     let ipv4_part = (raw_ip & 0xFFFFFFFF) as u32;
-                     // ipv4_part is already in host order relative to the extraction? warning: be careful with endianness.
-                     // u128::from_be_bytes converts to NATIVE endian u128.
-                     // The bytes were Network Order.
-                     // So raw_ip is now Host Order u128 representing the IP.
-                     // ::ffff:127.0.0.1 -> 00...FFFF7F000001
-                     
-                     if self.allowed_ips.contains(&ipv4_part) {
-                         Ok(self.resp_continue(req))
-                     } else {
-                         let ip_addr = std::net::Ipv4Addr::from(ipv4_part);
-                         tracing::warn!(pid = tracee_pid, dst_ip = %ip_addr, "Blocked outbound IPv4-mapped IPv6 connection");
-                         Ok(self.resp_error(req, libc::EACCES))
-                     }
+                 // Task 5: Robust IPv4-mapped IPv6 Handling
+                 if let Some(ipv4_addr) = ipv6_addr.to_ipv4_mapped() {
+                      // It's an IPv4-mapped address (::ffff:a.b.c.d)
+                      let ip_u32 = u32::from(ipv4_addr); // Native Endian (Host Order)
+                      
+                      if self.allowed_ips.contains(&ip_u32) {
+                           Ok(self.resp_continue(req))
+                      } else {
+                           tracing::warn!(pid = tracee_pid, dst_ip = %ipv4_addr, "Blocked outbound IPv4-mapped IPv6 connection");
+                           Ok(self.resp_error(req, libc::EACCES))
+                      }
                  } else {
-                     if self.allowed_ips_v6.contains(&raw_ip) {
-                         Ok(self.resp_continue(req))
-                     } else {
-                         let ip_addr = std::net::Ipv6Addr::from(raw_ip);
-                         tracing::warn!(pid = tracee_pid, dst_ip = %ip_addr, "Blocked outbound IPv6 connection");
-                         Ok(self.resp_error(req, libc::EACCES))
-                     }
+                      // Pure IPv6 (or other types not mapped)
+                      let raw_ip = u128::from(ipv6_addr);
+                      if self.allowed_ips_v6.contains(&raw_ip) {
+                           Ok(self.resp_continue(req))
+                      } else {
+                           tracing::warn!(pid = tracee_pid, dst_ip = %ipv6_addr, "Blocked outbound IPv6 connection");
+                           Ok(self.resp_error(req, libc::EACCES))
+                      }
                  }
             },
             _ => {
@@ -344,12 +338,14 @@ impl SeccompLoop {
         // Task 1: Eliminate execve TOCTOU
         // Strategy: Block unauthorized execve(), but ALLOW the initial agent launch.
         
+        // Task T-01: Engine Shell Execution Bypass
+        // Remove wildcard /bin/ and /usr/bin/ allow-lists.
+        // Implement an explicit ExactMatch allow-list for approved binaries only.
+        // Add specific deny logic for shells.
+
         let filename_ptr = req.data.args[0];
         let tracee_pid = req.pid as pid_t;
         
-        // Read filename
-        // Max path length 4096
-        // Read the null-terminated string from tracee memory
         let path_bytes = match self.read_path_tracee(tracee_pid, filename_ptr) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -358,27 +354,54 @@ impl SeccompLoop {
             }
         };
         
-        // Safely convert bytes to a comparable Path type
+        // Use OsStr for path comparison to avoid UTF-8 issues if possible, 
+        // but verify against string allowlists.
         let path_str = String::from_utf8_lossy(&path_bytes);
         let path = std::path::Path::new(path_str.as_ref());
         
-        // Validate execution vector against allowed paths
-        let allowed = path == self.allowed_command.as_path() 
-            || path.starts_with("/workspace/") 
-            || path.starts_with("/bin/") 
-            || path.starts_with("/usr/bin/") 
-            || self.manifest.readonly_mounts.iter().any(|m| path.starts_with(m));
+        // 1. Explicit Deny List (Shells)
+        let binding = path.file_name().unwrap_or_default().to_string_lossy();
+        let name = binding.as_ref();
+        match name {
+            "sh" | "bash" | "dash" | "zsh" | "csh" | "ksh" | "powershell" | "pwsh" | "cmd.exe" => {
+                tracing::warn!(pid = tracee_pid, binary = ?name, "Blocked shell execution attempt");
+                return Ok(self.resp_error(req, libc::EACCES));
+            },
+            _ => {}
+        }
+        
+        // 2. Exact Match Allow List
+        // We only allow:
+        // - The `allowed_command` explicitly passed to the Supervisor
+        // - Specific trusted runtimes if needed (e.g. node, python) - here we stick to bare minimum to be secure.
+        // - Read-only mounts are treated as data unless they effectively contain the binary. 
+        //   However, we should probably NOT allow executing *anything* from a readonly mount blindly 
+        //   unless it's the intended binary.
+        
+        // Strictly allow ONLY the target binary (self.allowed_command)
+        // OR if the path is an absolute path to a known safe utility *if required*.
+        // For now, adhere to T-01: "Implement an explicit ExactMatch allow-list for approved binaries only".
+        
+        let mut allowed = path == self.allowed_command.as_path();
+        
+        // Allow common trusted interpreters if they are the allowed_command or explicitly whitelisted
+        // Example: if allowed_command is "node", then "node" is allowed.
+        // If we want to allow "git" as a helper, we add it here.
+        // For standard "Agent" use case, we might need basic tools? 
+        // User instruction implies: "(e.g., node, python, git)"
+        
+        let whitelist = ["/usr/bin/node", "/usr/bin/python3", "/usr/bin/git", "/bin/ls", "/bin/cat"];
+        if !allowed {
+            allowed = whitelist.iter().any(|&p| path == std::path::Path::new(p));
+        }
 
         if allowed {
             tracing::debug!("Permitting execve for whitelisted path: {:?}", path);
             Ok(self.resp_continue(req))
         } else {
-            tracing::warn!(
-                pid = tracee_pid,
-                "Blocked execve() to eliminate TOCTOU. Agent must use execveat(FD) or tool executor. Path: {:?}",
-                path
-            );
-            return Ok(self.resp_error(req, libc::EACCES));
+             // Block others
+             tracing::warn!(pid = tracee_pid, path = ?path, "Blocked execve() - Not in ExactMatch AllowList");
+             Ok(self.resp_error(req, libc::EACCES))
         }
     }
 
