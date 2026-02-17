@@ -2,7 +2,7 @@ use mcp_j_proxy::JsonRpcProxy;
 use serde_json::json;
 
 #[test]
-fn test_shell_metacharacters_are_blocked() {
+fn test_shell_metacharacters_are_quoted() {
     let proxy = JsonRpcProxy::default();
 
     let dangerous_inputs = vec![
@@ -37,12 +37,17 @@ fn test_shell_metacharacters_are_blocked() {
         let result = proxy.validate_and_parse(&payload.to_string());
 
         match result {
-            Ok(_) => panic!("VULNERABILITY: Input should have been blocked but wasn't: '{}'", input),
+            Ok(val) => {
+                 let cmd = val["params"]["arguments"]["cmd"].as_str().unwrap();
+                 println!("Input: '{}' -> Quoted: '{}'", input, cmd);
+                 // Verify it is quoted. shlex usually adds single quotes.
+                 if !cmd.starts_with('\'') || !cmd.ends_with('\'') {
+                      panic!("Input was not properly quoted: '{}' -> '{}'", input, cmd);
+                 }
+            },
             Err(val) => {
                 let err_msg = val["error"]["message"].as_str().unwrap();
-                println!("Successfully blocked: '{}' -> {}", input, err_msg);
-                assert!(err_msg.contains("MCP-J SECCOMP: Argument contains forbidden shell metacharacter sequence"),
-                        "Unexpected error message: {}", err_msg);
+                panic!("Input was blocked unexpectedly: '{}' -> {}", input, err_msg);
             }
         }
     }
@@ -62,7 +67,6 @@ fn test_safe_inputs_allowed() {
         "echo path/to/file",
         "echo param=value",
         "echo \"Hello, world!\"",
-        // Should confirm that legitimate JSON is fine, assuming it doesn't contain shell chars
     ];
 
     for input in safe_inputs {
@@ -80,5 +84,14 @@ fn test_safe_inputs_allowed() {
 
         let result = proxy.validate_and_parse(&payload.to_string());
         assert!(result.is_ok(), "Safe input was blocked: '{}'", input);
+
+        // Also verify safe inputs are quoted, as they are "unknown tools" to the proxy
+        // unless they are whitelisted. "execute_command" is not "read_file" or "list_directory".
+        // So validate_arguments will run and quote them.
+        let val = result.unwrap();
+        let cmd = val["params"]["arguments"]["cmd"].as_str().unwrap();
+        // shlex can use ' or " depending on content
+        assert!((cmd.starts_with('\'') && cmd.ends_with('\'')) || (cmd.starts_with('"') && cmd.ends_with('"')),
+                "Safe input should also be quoted: '{}' -> '{}'", input, cmd);
     }
 }
