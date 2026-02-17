@@ -1,3 +1,5 @@
+[Under construction]
+
 # MCP-J: Secure MCP Agent Runtime
 
 MCP-J is a hardened, secure runtime environment for executing untrusted [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) agents. It leverages modern Linux kernel isolation primitives to enforce strict boundaries between the agent and the host system, mitigating risks associated with executing potentially diverse AI-generated code or tools.
@@ -56,7 +58,7 @@ The official VSCode extension provides a seamless integration with the MCP-J run
 
 ## Security Status
 
-**Current Status**: 🛡️ **Hardened Beta** 🛡️
+**Current Status**: 🛡️ **Hardened Beta** 🛡️ [Currently may be broken will update when sorted out]
 
 This project has undergone significant security hardening. However, it should be reviewed and tested in your specific environment before deployment in high-assurance contexts.
 
