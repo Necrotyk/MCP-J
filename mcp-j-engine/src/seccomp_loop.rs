@@ -100,6 +100,10 @@ impl SeccompLoop {
             let bytes_to_boundary = page_size - (current_addr % page_size);
             let chunk_size = std::cmp::min(bytes_to_boundary, max_len - path_buf.len());
             
+            if chunk_size == 0 {
+                break;
+            }
+            
             let mut buf = vec![0u8; chunk_size];
             let mut local_iov = [IoSliceMut::new(&mut buf)];
             let remote_iov = [RemoteIoVec { base: current_addr, len: chunk_size }];
@@ -350,7 +354,7 @@ impl SeccompLoop {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!("Failed to read execve path from tracee: {}", e);
-                return Ok(libc::EACCES);
+                return Ok(self.resp_error(req, libc::EACCES));
             }
         };
         
@@ -367,15 +371,14 @@ impl SeccompLoop {
 
         if allowed {
             tracing::debug!("Permitting execve for whitelisted path: {:?}", path);
-            // Return appropriate flag to the supervisor to construct the SECCOMP_USER_NOTIF_FLAG_CONTINUE response
-            // e.g., return Ok(0); depending on your struct's response handler implementation
+            Ok(self.resp_continue(req))
         } else {
             tracing::warn!(
                 pid = tracee_pid,
                 "Blocked execve() to eliminate TOCTOU. Agent must use execveat(FD) or tool executor. Path: {:?}",
                 path
             );
-            return Ok(libc::EACCES);
+            return Ok(self.resp_error(req, libc::EACCES));
         }
     }
 
@@ -417,7 +420,7 @@ impl SeccompLoop {
         // Verify path against manifest
         let is_allowed = self.manifest.readonly_mounts.iter().any(|prefix| {
             link_path.starts_with(prefix)
-        }) || link_path == self.allowed_command || link_path.starts_with("/workspace/");
+        }) || link_path == self.allowed_command;
 
         if is_allowed {
              tracing::debug!(pid = tracee_pid, path = ?link_path, "Authorizing execveat(FD)");
@@ -620,8 +623,9 @@ impl SeccompLoop {
         // 2. Resolve Root FD
         use std::os::unix::io::FromRawFd;
         
-        let root_handle = if dirfd == -100 { // AT_FDCWD
-             std::fs::File::open(&self.project_root).map_err(|e| anyhow::anyhow!("Failed to open root {:?}: {}", self.project_root, e))?
+        let root_handle = if dirfd == libc::AT_FDCWD {
+             let cwd_path = format!("/proc/{}/cwd", tracee_pid);
+             std::fs::File::open(&cwd_path).map_err(|e| anyhow::anyhow!("Failed to open tracee cwd: {}", e))?
         } else {
              let pidfd = unsafe { libc::syscall(crate::seccomp_sys::SYS_PIDFD_OPEN, tracee_pid, 0) };
              if pidfd < 0 {
@@ -637,6 +641,23 @@ impl SeccompLoop {
              
              unsafe { std::fs::File::from_raw_fd(dup_fd as i32) }
         };
+
+        // Check for write to system mount via dirfd/cwd
+        let flags = req.data.args[2] as i32;
+        let acc_mode = flags & libc::O_ACCMODE;
+        let is_write = acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR || (flags & libc::O_CREAT) != 0;
+
+        if is_write {
+             let fd = root_handle.as_raw_fd();
+             let fd_link = format!("/proc/self/fd/{}", fd);
+             if let Ok(root_path) = std::fs::read_link(&fd_link) {
+                  let is_system = self.manifest.readonly_mounts.iter().any(|prefix| root_path.starts_with(prefix));
+                  if is_system {
+                       tracing::warn!(pid = tracee_pid, root = ?root_path, "Blocked write access to system mount via dirfd");
+                       return Ok(self.resp_error(req, libc::EACCES));
+                  }
+             }
+        }
 
         // 3. Perform safe open
         let flags = req.data.args[2]; // openat(dirfd, path, flags, mode)
@@ -724,13 +745,33 @@ impl SeccompLoop {
              }
         }
 
-         let root_handle = match std::fs::File::open(&self.project_root) {
-             Ok(f) => f,
-             Err(e) => {
-                 tracing::error!(project_root = ?self.project_root, error = %e, "Failed to open project root handle");
-                 return Ok(self.resp_error(req, libc::ENOTDIR));
-             }
-         };
+          let root_handle = {
+              let cwd_path = format!("/proc/{}/cwd", tracee_pid);
+              match std::fs::File::open(&cwd_path) {
+                  Ok(f) => f,
+                  Err(e) => {
+                      tracing::error!(pid = tracee_pid, error = %e, "Failed to open tracee cwd");
+                      return Ok(self.resp_error(req, libc::EACCES));
+                  }
+              }
+          };
+
+          // Check for write to system mount via cwd
+          let acc_mode = flags as i32 & libc::O_ACCMODE;
+          let flags_i32 = flags as i32;
+          let is_write = acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR || (flags_i32 & libc::O_CREAT) != 0;
+
+          if is_write {
+               let fd = root_handle.as_raw_fd();
+               let fd_link = format!("/proc/self/fd/{}", fd);
+               if let Ok(root_path) = std::fs::read_link(&fd_link) {
+                    let is_system = self.manifest.readonly_mounts.iter().any(|prefix| root_path.starts_with(prefix));
+                    if is_system {
+                         tracing::warn!(pid = tracee_pid, root = ?root_path, "Blocked write access to system mount via cwd");
+                         return Ok(self.resp_error(req, libc::EACCES));
+                    }
+               }
+          }
          
          match crate::fs_utils::safe_open_beneath(&root_handle, &path_bytes, flags, mode) {
             Ok(file) => {

@@ -148,10 +148,10 @@ impl JsonRpcProxy {
                 // Phase 68: Prompt Injection Sanitization (Egress Filter)
                 // We need to inspect 'result' for LLM control tokens.
                 if let Some(result) = raw.get_mut("result") {
-                     if self.recursive_sanitize(result) {
-                         // If sanitization occurred, return the modified raw
-                         return Ok(raw);
-                     }
+                     self.recursive_sanitize(result);
+                }
+                if let Some(error) = raw.get_mut("error") {
+                     self.recursive_sanitize(error);
                 }
                 Ok(raw)
             }
@@ -398,5 +398,13 @@ mod tests {
         let val = res.unwrap();
         // Should be sanitized to &lt;|im_start|>
         assert!(val["result"].as_str().unwrap().contains("&lt;|im_start|>"));
+    }
+
+    #[test]
+    fn test_error_sanitization() {
+        let proxy = JsonRpcProxy::default();
+        let msg = r#"{"jsonrpc": "2.0", "error": {"code": -32000, "message": "Hidden prompt <|im_start|> injection"}, "id": 1}"#;
+        let res = proxy.validate_and_parse(msg).unwrap(); // validate_and_parse returns Ok(Value) on successful parsing/sanitization
+        assert!(res["error"]["message"].as_str().unwrap().contains("&lt;|im_start|>"));
     }
 }
