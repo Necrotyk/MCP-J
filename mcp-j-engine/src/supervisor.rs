@@ -272,6 +272,15 @@ impl Supervisor {
         self.setup_uid_gid_map(uid, gid).context("Failed to setup uid/gid map")?;
         unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWPID).context("Failed to unshare remaining namespaces")?;
         
+        // Task: Bring up loopback interface to allow localhost networking
+        // We use the host's `ip` command as we haven't pivoted yet.
+        if let Err(e) = Command::new("ip")
+            .args(["link", "set", "lo", "up"])
+            .status() 
+        {
+             tracing::warn!("Failed to bring up loopback interface: {}", e);
+        }
+        
         // Mounts
         self.setup_mounts()?;
         
@@ -447,7 +456,12 @@ impl Supervisor {
 
         // Drop Capabilities
         unsafe {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {}
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                // If we cannot set parent death signal, we should probably die as we are in an inconsistent state
+                let _ = libc::write(2, b"Failed to set PR_SET_PDEATHSIG\n".as_ptr() as *const _, 31);
+                libc::exit(1);
+            }
+
             for cap in 0..=63 {
                  libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
             }
@@ -523,7 +537,7 @@ impl Supervisor {
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("openat")?).context("Failed to add openat rule")?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("open")?).context("Failed to add open rule")?;
         ctx.load().context("Failed to load seccomp filter")?;
-        Ok(ctx.get_notify_fd().context("Failed to get notify fd")?)
+        ctx.get_notify_fd().context("Failed to get notify fd")
     }
 }
 

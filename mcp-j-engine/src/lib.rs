@@ -22,7 +22,7 @@ pub fn check_kernel_compatibility() -> anyhow::Result<()> {
 fn validate_kernel_version(release_str: &str) -> anyhow::Result<()> {
     // Task 4.2: Robust parsing
     // Strip "v" prefix if present
-    let clean = release_str.trim_start_matches(|c: char| !c.is_digit(10));
+    let clean = release_str.trim_start_matches(|c: char| !c.is_ascii_digit());
     
     let parts: Vec<&str> = clean.split('.').collect();
     if parts.len() < 2 {
@@ -31,7 +31,7 @@ fn validate_kernel_version(release_str: &str) -> anyhow::Result<()> {
     
     // Helper to extract number from segment (e.g. "1-rc1" -> 1)
     let parse_part = |s: &str| -> anyhow::Result<u32> {
-        let digits: String = s.chars().take_while(|c| c.is_digit(10)).collect();
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.is_empty() {
              anyhow::bail!("Invalid version segment: {}", s);
         }

@@ -9,6 +9,8 @@
         "/usr/bin",
         "/lib",
         "/usr/lib",
+        "/lib64",
+        "/usr/lib64",
         "/usr/lib/python3.10",
         "/usr/local/lib/python3.10",
         "/etc/alternatives"

@@ -19,7 +19,7 @@ use std::collections::HashSet;
 #[derive(Clone)]
 pub struct SeccompLoop {
     notify_fd: RawFd,
-    project_root: PathBuf,
+    // project_root: PathBuf, // Removed unused field
     allowed_command: PathBuf,
     manifest: SandboxManifest,
     allowed_ips: HashSet<u32>,
@@ -27,7 +27,7 @@ pub struct SeccompLoop {
 }
 
 impl SeccompLoop {
-    pub fn new(notify_fd: RawFd, project_root: PathBuf, allowed_command: PathBuf, manifest: SandboxManifest) -> Self {
+    pub fn new(notify_fd: RawFd, _project_root: PathBuf, allowed_command: PathBuf, manifest: SandboxManifest) -> Self {
         eprintln!("DEBUG: SeccompLoop::new starting");
         // Pre-parse allowed IPs into u32 (network byte order)
         let mut allowed_ips = HashSet::new();
@@ -65,8 +65,9 @@ impl SeccompLoop {
         }
 
         eprintln!("DEBUG: SeccompLoop::new finished");
-        Self { notify_fd, project_root, allowed_command, manifest, allowed_ips, allowed_ips_v6 }
+        Self { notify_fd, allowed_command, manifest, allowed_ips, allowed_ips_v6 }
     }
+
     
     // Helper to read memory from the tracee
     fn read_tracee_memory(&self, pid: pid_t, addr: u64, len: usize) -> Result<Vec<u8>> {
@@ -603,15 +604,14 @@ impl SeccompLoop {
                          tracing::warn!(pid = pid, dst_ip = %ip_addr, "Blocked outbound UDP/TCP (v4-mapped) (sendto/msg)");
                          Ok(self.resp_error(req, libc::EACCES))
                      }
+                 } else if self.allowed_ips_v6.contains(&raw_ip) {
+                     Ok(self.resp_continue(req))
                  } else {
-                     if self.allowed_ips_v6.contains(&raw_ip) {
-                         Ok(self.resp_continue(req))
-                     } else {
-                         let ip_addr = std::net::Ipv6Addr::from(raw_ip);
-                         tracing::warn!(pid = pid, dst_ip = %ip_addr, "Blocked outbound IPv6 UDP/TCP (sendto/msg)");
-                         Ok(self.resp_error(req, libc::EACCES))
-                     }
+                     let ip_addr = std::net::Ipv6Addr::from(raw_ip);
+                     tracing::warn!(pid = pid, dst_ip = %ip_addr, "Blocked outbound IPv6 UDP/TCP (sendto/msg)");
+                     Ok(self.resp_error(req, libc::EACCES))
                  }
+
             },
             _ => Ok(self.resp_error(req, libc::EAFNOSUPPORT))
         }

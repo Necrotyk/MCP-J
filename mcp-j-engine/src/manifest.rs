@@ -1,21 +1,28 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SecurityMode {
+    #[default]
     Enforcing,
     Audit,
 }
 
-impl Default for SecurityMode {
-    fn default() -> Self {
-        SecurityMode::Enforcing
-    }
-}
-
 fn default_ipc_limit() -> u32 {
     10
+}
+
+fn default_allowed_runtimes() -> Vec<String> {
+    vec![
+        "/usr/bin/node".to_string(),
+        "/usr/local/bin/node".to_string(),
+        "/usr/bin/python3".to_string(),
+        "/usr/local/bin/python3".to_string(),
+        "/usr/bin/git".to_string(),
+        "/bin/ls".to_string(),
+        "/bin/cat".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +41,7 @@ pub struct SandboxManifest {
     pub allowed_dns_resolvers: Vec<String>,
     #[serde(default)]
     pub allowed_egress_ports: Vec<u16>,
-    #[serde(default)]
+    #[serde(default = "default_allowed_runtimes")]
     pub allowed_runtimes: Vec<String>,
     pub max_cpu_quota_pct: u32,
     pub mode: SecurityMode,
@@ -61,21 +68,14 @@ impl Default for SandboxManifest {
                 "read_file".to_string(),
                 "list_directory".to_string(),
             ]),
-            allowed_runtimes: vec![
-                "/usr/bin/node".to_string(),
-                "/usr/local/bin/node".to_string(),
-                "/usr/bin/python3".to_string(),
-                "/usr/local/bin/python3".to_string(),
-                "/usr/bin/git".to_string(),
-                "/bin/ls".to_string(),
-                "/bin/cat".to_string(),
-            ],
+            allowed_runtimes: default_allowed_runtimes(),
             allowed_dns_resolvers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             max_cpu_quota_pct: 100,
-            mode: SecurityMode::Enforcing,
+            mode: SecurityMode::default(),
         }
     }
 }
+
 
 
 #[cfg(test)]
@@ -137,5 +137,13 @@ mod tests {
         let expected = SandboxManifest::default();
         assert_eq!(manifest.allowed_egress_ips, expected.allowed_egress_ips);
         assert_eq!(manifest.readonly_mounts, expected.readonly_mounts);
+    }
+
+    #[test]
+    fn test_allowed_runtimes_default() {
+        let json = r#"{}"#;
+        let manifest: SandboxManifest = serde_json::from_str(json).expect("Failed to deserialize empty object");
+        assert!(!manifest.allowed_runtimes.is_empty());
+        assert!(manifest.allowed_runtimes.contains(&"/usr/bin/python3".to_string()));
     }
 }
