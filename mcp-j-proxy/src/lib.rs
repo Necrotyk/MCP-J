@@ -85,7 +85,7 @@ impl JsonRpcProxy {
 
             // Handle Request
             // Optimization: Consuming `raw` instead of cloning it prevents large copy.
-            let mut request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
+            let mut request: JsonRpcRequest = match serde_json::from_value(raw) {
                 Ok(r) => r,
                 Err(e) => {
                     let err = serde_json::json!({
