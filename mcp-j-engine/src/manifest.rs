@@ -34,6 +34,8 @@ pub struct SandboxManifest {
     pub allowed_dns_resolvers: Vec<String>,
     #[serde(default)]
     pub allowed_egress_ports: Vec<u16>,
+    #[serde(default)]
+    pub allowed_runtimes: Vec<String>,
     pub max_cpu_quota_pct: u32,
     pub mode: SecurityMode,
 }
@@ -59,6 +61,13 @@ impl Default for SandboxManifest {
                 "read_file".to_string(),
                 "list_directory".to_string(),
             ]),
+            allowed_runtimes: vec![
+                "/usr/bin/node".to_string(),
+                "/usr/bin/python3".to_string(),
+                "/usr/bin/git".to_string(),
+                "/bin/ls".to_string(),
+                "/bin/cat".to_string(),
+            ],
             allowed_dns_resolvers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             max_cpu_quota_pct: 100,
             mode: SecurityMode::Enforcing,

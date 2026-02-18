@@ -79,8 +79,13 @@ impl LandlockRuleset {
             
         // Task 5: Network Rules (V4+)
         let mut handle_net = false;
-        if supported_abi >= ABI::V4 {
-             // We restrict network access by default (deny all) unless explicit rules are added.
+        
+        // Fix T-01: Landlock Network Blackhole
+        // If allow_tcp_connect is true, we skip AccessNet restriction entirely
+        // because we cannot add allow-rules with current crate.
+        // We rely on Seccomp for filtering in that case.
+        // We ONLY restrict AccessNet if we explicitly want to BLOCK connections (allow_tcp_connect = false).
+        if !self.allow_tcp_connect && supported_abi >= ABI::V4 {
              builder = builder.handle_access(AccessNet::from_all(supported_abi))?;
              handle_net = true;
         }
@@ -88,25 +93,11 @@ impl LandlockRuleset {
         let mut ruleset = builder.create()?;
         
         if handle_net {
-            /*
-            if self.allow_tcp_connect {
-                // Task 5: Landlock V4 Network Enforcement (Temporarily Disabled)
-                // The currently available `landlock` crate (v0.4.4) on crates.io does not export `NetPortRule`
-                // or allow us to add network rules easily.
-                // Enabling AccessNet restriction without adding allow rules would block ALL network access,
-                // which breaks connectivity if allow_tcp_connect is true.
-                // Therefore, we skip enabling network restriction logic if we intend to allow connections,
-                // relying on Seccomp for now.
-                
-                // ... implementation using private `net` module would require FFI or Nightly ...
-                tracing::warn!("Landlock Network Rules skipped due to crate version limitation (v0.4). Relying on Seccomp.");
-            } else {
-                // We enabled handle_access(AccessNet) without adding rules -> Deny All.
-                tracing::info!("Landlock V4: Blocking ALL network access (Default Deny)");
-            }
-            */
-            tracing::warn!("Landlock Network Rules skipped due to crate version limitation (v0.4). Relying on Seccomp.");
+            tracing::info!("Landlock V4: Blocking ALL network access (Default Deny)");
+        } else if supported_abi >= ABI::V4 {
+             tracing::warn!("Landlock V4: Network restriction disabled to allow connectivity (Relying on Seccomp)");
         }
+
 
         for (path, access) in &self.allowed_paths {
              if !path.exists() {
