@@ -63,7 +63,9 @@ impl Default for SandboxManifest {
             ]),
             allowed_runtimes: vec![
                 "/usr/bin/node".to_string(),
+                "/usr/local/bin/node".to_string(),
                 "/usr/bin/python3".to_string(),
+                "/usr/local/bin/python3".to_string(),
                 "/usr/bin/git".to_string(),
                 "/bin/ls".to_string(),
                 "/bin/cat".to_string(),
@@ -74,6 +76,7 @@ impl Default for SandboxManifest {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -236,12 +236,20 @@ impl JsonRpcProxy {
             "read_file" => {
                 if !args_obj.contains_key("path") { return Err("Missing 'path' argument".into()); }
                 let p = args_obj["path"].as_str().ok_or("'path' must be a string")?;
+                
+                // Optimization: Early rejection of traversal attempts
+                if p.contains("..") { return Err("Invalid 'path': Traversal detected".into()); }
+                
                 if !path_regex.is_match(p) { return Err("Invalid 'path': Must match ^[\\w\\-. /]+$".into()); }
                 if args_obj.len() != 1 { return Err("Unexpected arguments for read_file".into()); }
             },
             "list_directory" => {
                  if !args_obj.contains_key("path") { return Err("Missing 'path' argument".into()); }
                  let p = args_obj["path"].as_str().ok_or("'path' must be a string")?;
+                 
+                 // Optimization: Early rejection of traversal attempts
+                 if p.contains("..") { return Err("Invalid 'path': Traversal detected".into()); }
+                 
                  if !path_regex.is_match(p) { return Err("Invalid 'path': Must match ^[\\w\\-. /]+$".into()); }
                  if args_obj.len() != 1 { return Err("Unexpected arguments for list_directory".into()); }
             },
@@ -249,6 +257,7 @@ impl JsonRpcProxy {
         }
         Ok(())
     }
+
 
     fn validate_arguments(&self, args: &mut Value, depth: usize) -> Result<(), String> {
         const MAX_RECURSION_DEPTH: usize = 128;
