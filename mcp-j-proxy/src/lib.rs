@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::OnceLock;
+
+static PATH_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct JsonRpcProxy {
@@ -230,7 +233,8 @@ impl JsonRpcProxy {
     fn validate_tool_schema(&self, name: &str, args: &Value) -> Result<(), String> {
         let args_obj = args.as_object().ok_or("Arguments must be an object")?;
         // Task B-3: Strict Regex for paths
-        let path_regex = regex::Regex::new(r"^[\w\-. /]+$").unwrap();
+        // Optimization: Compile regex once
+        let path_regex = PATH_REGEX.get_or_init(|| regex::Regex::new(r"^[\w\-. /]+$").expect("Invalid regex"));
         
         match name {
             "read_file" => {
