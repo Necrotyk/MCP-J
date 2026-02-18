@@ -390,10 +390,12 @@ impl SeccompLoop {
         // For standard "Agent" use case, we might need basic tools? 
         // User instruction implies: "(e.g., node, python, git)"
         
-        let whitelist = ["/usr/bin/node", "/usr/bin/python3", "/usr/bin/git", "/bin/ls", "/bin/cat"];
+        // Fix T-03: Dynamic Execve Allowlist
+        // Instead of hardcoded whitelist, use the dynamic list from manifest
         if !allowed {
-            allowed = whitelist.iter().any(|&p| path == std::path::Path::new(p));
+            allowed = self.manifest.allowed_runtimes.iter().any(|p| path == std::path::Path::new(p));
         }
+
 
         if allowed {
             tracing::debug!("Permitting execve for whitelisted path: {:?}", path);

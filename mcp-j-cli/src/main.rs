@@ -326,33 +326,30 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut 
     
     let content_length = tokio::time::timeout(timeout_duration, async {
         let mut content_length = None;
-        let mut header_bytes_read = 0;
-        const MAX_HEADER_SIZE: usize = 4096; // 4KB limit for all headers
+        const MAX_HEADER_SIZE: u64 = 4096; // 4KB limit for all headers
         
+        let mut taker = reader.take(MAX_HEADER_SIZE);
+        let mut first_line = true;
+
         loop {
             let mut line = String::new();
             
-            // Safe read_line equivalent that respects limits
-            loop {
-                let b = match reader.read_u8().await {
-                    Ok(b) => b,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        // EOF during header read
-                         if header_bytes_read == 0 { return Ok(None); } 
-                         return Err(anyhow::anyhow!("Unexpected EOF in headers"));
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                
-                header_bytes_read += 1;
-                if header_bytes_read > MAX_HEADER_SIZE {
-                    return Err(anyhow::anyhow!("Header size exceeded limit"));
+            // Optimized: Use read_line with take() limit instead of byte-by-byte
+            // This prevents massive context switching overhead (Fix T-02)
+            let n = taker.read_line(&mut line).await?;
+            
+            if n == 0 {
+                // EOF
+                if first_line {
+                    return Ok(None);
                 }
-                
-                line.push(b as char);
-                if line.ends_with('\n') {
-                    break;
-                }
+                return Err(anyhow::anyhow!("Unexpected EOF in headers"));
+            }
+            first_line = false;
+            
+            // Check for truncation (limit reached without newline)
+            if !line.ends_with('\n') {
+                 return Err(anyhow::anyhow!("Header size exceeded limit"));
             }
 
             let trimmed = line.trim();
@@ -375,7 +372,7 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut 
     // Check if we got EOF (None) from the inner loop
     let len = match content_length {
         Some(l) => l,
-        None => return Ok(None), // EOF at start
+        None => return Ok(None), // EOF at start or no Content-Length (treated as stream end)
     };
 
     // Phase 53: IPC Proxy Byte Saturation Limits (Dynamic)
@@ -390,8 +387,7 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut 
     }
 
     buf.resize(len, 0); // Reuse buffer
-    // For body read, we also want a timeout per byte? Or strict timeout for whole body?
-    // User only asked for timeout on header reads.
     reader.read_exact(buf).await?;
     Ok(Some(()))
 }
+
