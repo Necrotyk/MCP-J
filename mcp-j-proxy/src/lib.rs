@@ -241,6 +241,8 @@ impl JsonRpcProxy {
                 if p.contains("..") { return Err("Invalid 'path': Traversal detected".into()); }
                 
                 if !path_regex.is_match(p) { return Err("Invalid 'path': Must match ^[\\w\\-. /]+$".into()); }
+                if p.contains("..") { return Err("Invalid 'path': Path traversal '..' is not allowed".into()); }
+                if p.starts_with('/') { return Err("Invalid 'path': Absolute paths are not allowed".into()); }
                 if args_obj.len() != 1 { return Err("Unexpected arguments for read_file".into()); }
             },
             "list_directory" => {
@@ -251,6 +253,8 @@ impl JsonRpcProxy {
                  if p.contains("..") { return Err("Invalid 'path': Traversal detected".into()); }
                  
                  if !path_regex.is_match(p) { return Err("Invalid 'path': Must match ^[\\w\\-. /]+$".into()); }
+                 if p.contains("..") { return Err("Invalid 'path': Path traversal '..' is not allowed".into()); }
+                 if p.starts_with('/') { return Err("Invalid 'path': Absolute paths are not allowed".into()); }
                  if args_obj.len() != 1 { return Err("Unexpected arguments for list_directory".into()); }
             },
             _ => {}
