@@ -184,7 +184,7 @@ impl SeccompLoop {
         match syscall {
             libc::SYS_connect => self.handle_connect(req),
             libc::SYS_execve => self.handle_execve(req),
-            322 => self.handle_execveat(req), // SYS_execveat x86_64
+            libc::SYS_execveat => self.handle_execveat(req),
             libc::SYS_bind => self.handle_bind(req),
             libc::SYS_sendto => self.handle_sendto(req),
             libc::SYS_sendmsg => self.handle_sendmsg(req),
@@ -214,7 +214,7 @@ impl SeccompLoop {
         // Phase 58: "Dry-Run" Profiler (Audit Mode)
         use crate::manifest::SecurityMode;
         if self.manifest.mode == SecurityMode::Audit {
-            tracing::warn!(id = req.id, "AUDIT MODE: Allowing violation that would have been blocked");
+            tracing::warn!(id = req.id, syscall = req.data.nr, "AUDIT MODE: Allowing violation that would have been blocked");
             return self.resp_continue(req);
         }
 
@@ -227,114 +227,12 @@ impl SeccompLoop {
     }
 
     fn handle_connect(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
-        // Validation logic for connect
-        
         let addr_ptr = req.data.args[1];
         let addr_len = req.data.args[2] as usize;
         let tracee_pid = req.pid as pid_t;
         
-        // Strict length checking for known families
-        if addr_len < std::mem::size_of::<libc::sa_family_t>() {
-             return Ok(self.resp_error(req, libc::EINVAL));
-        }
-        
-        if addr_len > 128 { // Max sockaddr size usually
-             return Ok(self.resp_error(req, libc::EINVAL));
-        }
-
-        let buf = match self.read_tracee_memory(tracee_pid, addr_ptr, addr_len) {
-            Ok(b) => b,
-            Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
-        };
-
-        if buf.len() < 2 {
-             return Ok(self.resp_error(req, libc::EINVAL));
-        }
-        
-        let sa_family = u16::from_ne_bytes([buf[0], buf[1]]);
-        
-        match sa_family as i32 {
-            libc::AF_UNIX => {
-                 // Allow local unix sockets by default per logic
-                 // UNIX sockets are usually for IPC within namespaces if private.
-                 Ok(self.resp_continue(req))
-            },
-            libc::AF_INET => {
-                 if addr_len != std::mem::size_of::<libc::sockaddr_in>() {
-                      return Ok(self.resp_error(req, libc::EINVAL));
-                 }
-                 
-                 let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-                 if buf.len() < std::mem::size_of::<libc::sockaddr_in>() {
-                     return Ok(self.resp_error(req, libc::EINVAL));
-                 }
-                 
-                 unsafe {
-                     std::ptr::copy_nonoverlapping(
-                         buf.as_ptr(), 
-                         &mut sin as *mut _ as *mut u8, 
-                         std::mem::size_of::<libc::sockaddr_in>()
-                     );
-                 }
-                 
-                 // The hashset stores u32::from(Ipv4Addr). Ipv4Addr "127.0.0.1" -> 0x7F000001 (Host Order).
-                 // sin.sin_addr.s_addr is Network Order (Big Endian).
-                 // So we need: u32::from_be(sin.sin_addr.s_addr) to match Host Order.
-                 
-                 let ip_host_order = u32::from_be(sin.sin_addr.s_addr);
-                 
-                 if self.allowed_ips.contains(&ip_host_order) {
-                      Ok(self.resp_continue(req))
-                 } else {
-                      let ip_addr = std::net::Ipv4Addr::from(ip_host_order);
-                      tracing::warn!(pid = tracee_pid, dst_ip = %ip_addr, "Blocked outbound connection to IPv4");
-                      Ok(self.resp_error(req, libc::EACCES))
-                 }
-            },
-            libc::AF_INET6 => {
-                 // Task 2.2: IPv6 Validation
-                 if addr_len < std::mem::size_of::<libc::sockaddr_in6>() {
-                      return Ok(self.resp_error(req, libc::EINVAL));
-                 }
-                 
-                 let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-                 unsafe {
-                     std::ptr::copy_nonoverlapping(
-                         buf.as_ptr(), 
-                         &mut sin6 as *mut _ as *mut u8, 
-                         std::mem::size_of::<libc::sockaddr_in6>()
-                     );
-                 }
-                 
-                 let ipv6_addr = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                 
-                 // Task 5: Robust IPv4-mapped IPv6 Handling
-                 if let Some(ipv4_addr) = ipv6_addr.to_ipv4_mapped() {
-                      // It's an IPv4-mapped address (::ffff:a.b.c.d)
-                      let ip_u32 = u32::from(ipv4_addr); // Native Endian (Host Order)
-                      
-                      if self.allowed_ips.contains(&ip_u32) {
-                           Ok(self.resp_continue(req))
-                      } else {
-                           tracing::warn!(pid = tracee_pid, dst_ip = %ipv4_addr, "Blocked outbound IPv4-mapped IPv6 connection");
-                           Ok(self.resp_error(req, libc::EACCES))
-                      }
-                 } else {
-                      // Pure IPv6 (or other types not mapped)
-                      let raw_ip = u128::from(ipv6_addr);
-                      if self.allowed_ips_v6.contains(&raw_ip) {
-                           Ok(self.resp_continue(req))
-                      } else {
-                           tracing::warn!(pid = tracee_pid, dst_ip = %ipv6_addr, "Blocked outbound IPv6 connection");
-                           Ok(self.resp_error(req, libc::EACCES))
-                      }
-                 }
-            },
-            _ => {
-                 // Deny unknown families
-                 Ok(self.resp_error(req, libc::EAFNOSUPPORT))
-            }
-        }
+        // Delegate to unified address validation
+        self.validate_address(tracee_pid as i32, addr_ptr, addr_len, req)
     }
 
     fn handle_execve(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
@@ -630,33 +528,9 @@ impl SeccompLoop {
              Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
         };
 
-        // Phase 30: Lexical Path Traversal Eradication
-        if path_bytes.windows(2).any(|w| w == b"..") {
-            tracing::warn!(pid = tracee_pid, "Blocked openat with directory traversal payload ('..')");
-            return Ok(self.resp_error(req, libc::EACCES));
-        }
-
-        // Phase 20: Absolute Path Resolution Bypass (Library Loading)
-        if path_bytes.starts_with(b"/") {
-             use std::os::unix::ffi::OsStrExt;
-             let is_allowed_system = self.manifest.readonly_mounts.iter().any(|prefix| {
-                  let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();
-                  path_bytes.starts_with(prefix_bytes)
-             });
-             
-             if is_allowed_system {
-                  // Phase 31: Strict Flag Masking for System Mounts
-                  // Reject O_WRONLY, O_RDWR, O_CREAT for system mounts
-                  let acc_mode = req.data.args[2] as i32 & libc::O_ACCMODE;
-                  let flags = req.data.args[2] as i32;
-                  
-                  if acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR || (flags & libc::O_CREAT) != 0 {
-                      tracing::warn!(pid = tracee_pid, flags = flags, "Blocked write/create flags on system mount");
-                      return Ok(self.resp_error(req, libc::EACCES));
-                  }
-                  
-                  return Ok(self.resp_continue(req));
-             }
+        // Shared Security Claims (Traversal + System Mount Protection)
+        if let Err(resp) = self.validate_path_security(tracee_pid, &path_bytes, req.data.args[2] as i32, req.id) {
+             return Ok(resp);
         }
 
         // 2. Resolve Root FD
@@ -760,32 +634,9 @@ impl SeccompLoop {
             }
          };
          
-        // Phase 30: Lexical Path Traversal Eradication
-        if path_bytes.windows(2).any(|w| w == b"..") {
-            tracing::warn!(pid = tracee_pid, "Blocked open(legacy) with directory traversal payload ('..')");
-            return Ok(self.resp_error(req, libc::EACCES));
-        }
-
-        // Phase 20: Absolute Path Resolution Bypass (Library Loading)
-        if path_bytes.starts_with(b"/") {
-             use std::os::unix::ffi::OsStrExt;
-             let is_allowed_system = self.manifest.readonly_mounts.iter().any(|prefix| {
-                  let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();
-                  path_bytes.starts_with(prefix_bytes)
-             });
-             
-             if is_allowed_system {
-                  // Phase 31: Strict Flag Masking for System Mounts
-                  let acc_mode = flags as i32 & libc::O_ACCMODE;
-                  let flags_i32 = flags as i32;
-                  
-                  if acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR || (flags_i32 & libc::O_CREAT) != 0 {
-                      tracing::warn!(pid = tracee_pid, flags = flags, "Blocked write/create flags on system mount");
-                      return Ok(self.resp_error(req, libc::EACCES));
-                  }
-
-                  return Ok(self.resp_continue(req));
-             }
+        // Shared Security Claims (Traversal + System Mount Protection)
+        if let Err(resp) = self.validate_path_security(tracee_pid, &path_bytes, flags as i32, req.id) {
+             return Ok(resp);
         }
 
           let root_handle = {
@@ -836,6 +687,42 @@ impl SeccompLoop {
                 Ok(self.resp_error(req, libc::EACCES))
             }
          }
+    }
+
+
+    // Helper for Path Security
+    fn validate_path_security(&self, pid: pid_t, path_bytes: &[u8], flags: i32, request_id: u64) -> Result<(), seccomp_notif_resp> {
+        // 1. Traversal Check
+        let has_traversal = path_bytes == b".." || 
+                            path_bytes.starts_with(b"../") || 
+                            path_bytes.ends_with(b"/..") || 
+                            path_bytes.windows(4).any(|w| w == b"/../");
+
+        if has_traversal {
+            tracing::warn!(pid = pid, "Blocked open with directory traversal payload ('..')");
+            return Err(self.resp_error(&seccomp_notif { id: request_id, pid: pid as u32, ..unsafe { std::mem::zeroed() } }, libc::EACCES));
+        }
+
+        // 2. System Mount Write Protection
+        if path_bytes.starts_with(b"/") {
+             use std::os::unix::ffi::OsStrExt;
+             let is_allowed_system = self.manifest.readonly_mounts.iter().any(|prefix| {
+                  let prefix_bytes = std::ffi::OsStr::new(prefix).as_bytes();
+                  path_bytes.starts_with(prefix_bytes)
+             });
+             
+             if is_allowed_system {
+                  let acc_mode = flags & libc::O_ACCMODE;
+                  if acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR || (flags & libc::O_CREAT) != 0 {
+                      tracing::warn!(pid = pid, flags = flags, "Blocked write/create flags on system mount");
+                      return Err(self.resp_error(&seccomp_notif { id: request_id, pid: pid as u32, ..unsafe { std::mem::zeroed() } }, libc::EACCES));
+                  }
+                  
+                  // If system mount and RO, we allow host access (Continue)
+                  return Err(self.resp_continue(&seccomp_notif { id: request_id, pid: pid as u32, ..unsafe { std::mem::zeroed() } }));
+             }
+        }
+        Ok(())
     }
 }
 

@@ -100,11 +100,11 @@ impl JsonRpcProxy {
                     if let Some(params) = raw.get_mut("params") {
                         self.validate_tool_call(params)
                     } else {
-                        Ok(())
+                         Ok(())
                     }
                 }
                 "mcp-remote/authorize" | "mcp-remote/token" => {
-                    Err("Blocked restricted method: mcp-remote/*".to_string())
+                     Err("Blocked restricted method: mcp-remote/*".to_string())
                 }
                 _ => Ok(())
             };
@@ -229,7 +229,8 @@ impl JsonRpcProxy {
                 let p = args_obj["path"].as_str().ok_or("'path' must be a string")?;
                 
                 // Optimization: Early rejection of traversal attempts
-                if p.contains("..") { return Err("Invalid 'path': Traversal detected".into()); }
+                let has_traversal = p == ".." || p.starts_with("../") || p.ends_with("/..") || p.contains("/../");
+                if has_traversal { return Err("Invalid 'path': Traversal detected".into()); }
                 
                 if !path_regex.is_match(p) { return Err("Invalid 'path': Must match ^[\\w\\-. /]+$".into()); }
                 if p.contains("..") { return Err("Invalid 'path': Path traversal '..' is not allowed".into()); }
@@ -241,7 +242,8 @@ impl JsonRpcProxy {
                  let p = args_obj["path"].as_str().ok_or("'path' must be a string")?;
                  
                  // Optimization: Early rejection of traversal attempts
-                 if p.contains("..") { return Err("Invalid 'path': Traversal detected".into()); }
+                 let has_traversal = p == ".." || p.starts_with("../") || p.ends_with("/..") || p.contains("/../");
+                 if has_traversal { return Err("Invalid 'path': Traversal detected".into()); }
                  
                  if !path_regex.is_match(p) { return Err("Invalid 'path': Must match ^[\\w\\-. /]+$".into()); }
                  if p.contains("..") { return Err("Invalid 'path': Path traversal '..' is not allowed".into()); }

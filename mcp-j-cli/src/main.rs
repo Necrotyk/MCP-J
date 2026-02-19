@@ -55,7 +55,28 @@ async fn main() -> anyhow::Result<()> {
     
     mcp_j_engine::check_kernel_compatibility()?;
 
-    let binary = std::path::PathBuf::from(&cli.command[0]);
+    // Task 50: Canonicalize binary path for Seccomp consistency
+    let binary_arg = &cli.command[0];
+    let binary = if binary_arg.contains('/') {
+        std::fs::canonicalize(binary_arg).context("Failed to resolve absolute path of command")?
+    } else {
+        // Resolve from PATH manually since `which` crate is not available
+        if let Some(path_var) = std::env::var_os("PATH") {
+            let mut resolved = None;
+            for path in std::env::split_paths(&path_var) {
+                let candidate = path.join(binary_arg);
+                if candidate.is_file() {
+                    if let Ok(canon) = std::fs::canonicalize(&candidate) {
+                        resolved = Some(canon);
+                        break;
+                    }
+                }
+            }
+            resolved.ok_or_else(|| anyhow::anyhow!("Command '{}' not found in PATH", binary_arg))?
+        } else {
+             anyhow::bail!("PATH not set, cannot resolve command");
+        }
+    };
     let args = cli.command[1..].to_vec();
     let project_root = std::env::current_dir()?;
 
@@ -104,9 +125,13 @@ async fn main() -> anyhow::Result<()> {
 
     let inbound_task = tokio::spawn(async move {
         let mut buf = Vec::with_capacity(4096);
+        let mut header_buf = String::with_capacity(1024);
         loop {
             // Task 3: Dynamic limit
-            match read_lsp_message(&mut reader_in, &mut buf, manifest_limits.max_ipc_payload_mb).await {
+            // Task: Reuse buffer for headers
+            if header_buf.capacity() > 4096 { header_buf.shrink_to(4096); } // Check?
+            
+            match read_lsp_message(&mut reader_in, &mut buf, &mut header_buf, manifest_limits.max_ipc_payload_mb).await {
                 Ok(Some(())) => {
                     let msg_str = match std::str::from_utf8(&buf) {
                         Ok(s) => s,
@@ -165,8 +190,9 @@ async fn main() -> anyhow::Result<()> {
     
     let outbound_task = tokio::spawn(async move {
          let mut buf = Vec::with_capacity(4096);
+         let mut header_buf = String::with_capacity(1024);
          loop {
-            match read_lsp_message(&mut reader_out, &mut buf, manifest_limits_out.max_ipc_payload_mb).await {
+            match read_lsp_message(&mut reader_out, &mut buf, &mut header_buf, manifest_limits_out.max_ipc_payload_mb).await {
                 Ok(Some(())) => {
                     let msg_str = match std::str::from_utf8(&buf) {
                         Ok(s) => s,
@@ -302,24 +328,30 @@ async fn send_termination_notification(reason: &str) {
 // Phase 55: Ephemeral Garbage Collection
 fn cleanup_ephemeral(pid: u32) {
     tracing::info!(pid, "Executing ephemeral garbage collection");
-    let upper = format!("/tmp/mcp_upper_{}", pid);
-    let work = format!("/tmp/mcp_work_{}", pid);
+    let temp = std::env::temp_dir();
+    let upper = temp.join(format!("mcp_upper_{}", pid));
+    let work = temp.join(format!("mcp_work_{}", pid));
 
     // We use std::fs::remove_dir_all and log warnings on failure, 
     // ensuring we don't panic during a panic hook.
     if std::path::Path::new(&upper).exists() {
         if let Err(e) = std::fs::remove_dir_all(&upper) {
-            tracing::warn!(path = %upper, error = %e, "Failed to remove ephemeral upper dir");
+            tracing::warn!(path = ?upper, error = %e, "Failed to remove ephemeral upper dir");
         }
     }
     if std::path::Path::new(&work).exists() {
          if let Err(e) = std::fs::remove_dir_all(&work) {
-            tracing::warn!(path = %work, error = %e, "Failed to remove ephemeral work dir");
+            tracing::warn!(path = ?work, error = %e, "Failed to remove ephemeral work dir");
         }
     }
 }
 
-async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut Vec<u8>, max_mb: u32) -> anyhow::Result<Option<()>> {
+async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R, 
+    buf: &mut Vec<u8>, 
+    header_lines: &mut String,
+    max_mb: u32
+) -> anyhow::Result<Option<()>> {
     // Task 4: Harden LSP Reader (DoS Protection)
     // Enforce hard timeout on header reads
     let timeout_duration = std::time::Duration::from_secs(5);
@@ -332,11 +364,11 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut 
         let mut first_line = true;
 
         loop {
-            let mut line = String::new();
+            header_lines.clear();
             
             // Optimized: Use read_line with take() limit instead of byte-by-byte
             // This prevents massive context switching overhead (Fix T-02)
-            let n = taker.read_line(&mut line).await?;
+            let n = taker.read_line(header_lines).await?;
             
             if n == 0 {
                 // EOF
@@ -348,11 +380,11 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(reader: &mut R, buf: &mut 
             first_line = false;
             
             // Check for truncation (limit reached without newline)
-            if !line.ends_with('\n') {
+            if !header_lines.ends_with('\n') {
                  return Err(anyhow::anyhow!("Header size exceeded limit"));
             }
 
-            let trimmed = line.trim();
+            let trimmed = header_lines.trim();
             if trimmed.is_empty() {
                 // End of headers (\r\n\r\n or \n\n)
                 return Ok(content_length);
