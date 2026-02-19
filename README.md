@@ -1,4 +1,4 @@
-[Under construction]
+[Under construction - may not work as advertised in current state use at own risk]
 
 # MCP-J: Secure MCP Agent Runtime
 
