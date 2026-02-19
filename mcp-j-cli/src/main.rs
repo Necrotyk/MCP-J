@@ -418,8 +418,59 @@ async fn read_lsp_message<R: AsyncBufReadExt + Unpin>(
         ));
     }
 
-    buf.resize(len, 0); // Reuse buffer
-    reader.read_exact(buf).await?;
+    // Optimization: Use read_to_end with take() to avoid zero-initialization of large buffers.
+    // buf.resize(len, 0) performs a memset which is expensive for large payloads (e.g. 10MB).
+    // read_to_end handles uninitialized memory safely via read_buf.
+    buf.clear();
+    buf.reserve(len);
+    let mut taker = reader.take(len as u64);
+    let n = taker.read_to_end(buf).await?;
+
+    if n != len {
+         return Err(anyhow::anyhow!("Payload truncated: expected {} bytes, got {}", len, n));
+    }
+
     Ok(Some(()))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_read_lsp_message_optimization() {
+        let payload = "Hello world";
+        let content_len = payload.len();
+        let message = format!("Content-Length: {}\r\n\r\n{}", content_len, payload);
+
+        let mut reader = Cursor::new(message.as_bytes());
+        let mut buf = Vec::new();
+        let mut headers = String::new();
+        let max_mb = 1;
+
+        let res = read_lsp_message(&mut reader, &mut buf, &mut headers, max_mb).await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), Some(()));
+        assert_eq!(buf, payload.as_bytes());
+        assert_eq!(buf.len(), content_len);
+    }
+
+    #[tokio::test]
+    async fn test_read_lsp_message_truncated() {
+        let payload = "Hello world";
+        let content_len = payload.len();
+        // Send fewer bytes than promised
+        let message = format!("Content-Length: {}\r\n\r\nHel", content_len);
+
+        let mut reader = Cursor::new(message.as_bytes());
+        let mut buf = Vec::new();
+        let mut headers = String::new();
+        let max_mb = 1;
+
+        let res = read_lsp_message(&mut reader, &mut buf, &mut headers, max_mb).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("Payload truncated"));
+    }
+}
