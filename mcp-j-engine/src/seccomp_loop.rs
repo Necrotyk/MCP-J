@@ -35,6 +35,8 @@ impl SeccompLoop {
         allowed_ips.insert(0x7F000001); // 127.0.0.1
         
         // Task 2.2: DNS Manifest Integration
+        // Explicitly allow UDP/TCP traffic to configured DNS resolvers.
+        // This replaces hardcoded DNS servers (e.g. 1.1.1.1, 8.8.8.8) to allow user configuration.
         for resolver in &manifest.allowed_dns_resolvers {
             if let Ok(ip) = resolver.parse::<std::net::Ipv4Addr>() {
                  allowed_ips.insert(u32::from(ip));

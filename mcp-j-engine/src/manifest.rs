@@ -69,7 +69,7 @@ impl Default for SandboxManifest {
                 "list_directory".to_string(),
             ]),
             allowed_runtimes: default_allowed_runtimes(),
-            allowed_dns_resolvers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            allowed_dns_resolvers: vec![],
             max_cpu_quota_pct: 100,
             mode: SecurityMode::default(),
         }
@@ -94,6 +94,14 @@ mod tests {
         assert!(manifest.allowed_tools.is_some());
         let tools = manifest.allowed_tools.as_ref().unwrap();
         assert!(tools.contains(&"read_file".to_string()));
+        assert!(manifest.allowed_dns_resolvers.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_custom_dns() {
+        let json = r#"{"allowed_dns_resolvers": ["8.8.4.4"]}"#;
+        let manifest: SandboxManifest = serde_json::from_str(json).expect("Failed to deserialize custom DNS");
+        assert_eq!(manifest.allowed_dns_resolvers, vec!["8.8.4.4".to_string()]);
     }
 
     #[test]
