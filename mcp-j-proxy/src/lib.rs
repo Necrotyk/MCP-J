@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::OnceLock;
 
@@ -6,15 +5,6 @@ use std::sync::OnceLock;
 pub struct JsonRpcProxy {
     allowed_tools: Option<Vec<String>>,
     sanitization_regex: regex::Regex,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-#[allow(dead_code)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    method: String,
-    params: Option<Value>,
-    id: Option<Value>,
 }
 
 impl Default for JsonRpcProxy {
@@ -83,33 +73,31 @@ impl JsonRpcProxy {
                 }
             }
 
-            // Handle Request
-            // Optimization: Consuming `raw` instead of cloning it prevents large copy.
-            let mut request: JsonRpcRequest = match serde_json::from_value(raw) {
-                Ok(r) => r,
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "error": { "code": -32600, "message": format!("Invalid Request: {}", e) },
-                        "id": id
-                    });
-                    return Err(err);
-                }
-            };
-
-            // Protocol Enforcement
-            if request.jsonrpc != "2.0" {
-                return Err(serde_json::json!({
+            // 2. Protocol Enforcement (Manual Validation)
+            // Ensure jsonrpc is "2.0"
+            match raw.get("jsonrpc") {
+                Some(Value::String(s)) if s == "2.0" => {},
+                _ => return Err(serde_json::json!({
                     "jsonrpc": "2.0",
                     "error": { "code": -32600, "message": "Invalid JSON-RPC version" },
                     "id": id
-                }));
+                }))
             }
 
-            // Method Validation
-            let validation_result = match request.method.as_str() {
+            // Ensure method is a string and valid
+            let method_str = match raw.get("method") {
+                Some(Value::String(s)) => s.clone(),
+                _ => return Err(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32600, "message": "Invalid Request: method must be a string" },
+                    "id": id
+                }))
+            };
+
+            // 3. Method Validation & Logic
+            let validation_result = match method_str.as_str() {
                 "tools/call" => {
-                    if let Some(params) = &mut request.params {
+                    if let Some(params) = raw.get_mut("params") {
                         self.validate_tool_call(params)
                     } else {
                         Ok(())
@@ -134,13 +122,15 @@ impl JsonRpcProxy {
                     return Err(err);
             }
 
-            serde_json::to_value(request).map_err(|e| {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -32603, "message": format!("Internal error during serialization: {}", e) },
-                    "id": id
-                })
-            })
+            // 4. Strip Unknown Fields (Security / Strictness)
+            // Remove any key that is not jsonrpc, method, params, id.
+            // This maintains the strictness behavior of the previous implementation
+            // (which deserialized into a struct with only these fields).
+            if let Some(obj) = raw.as_object_mut() {
+                obj.retain(|k, _| matches!(k.as_str(), "jsonrpc" | "method" | "params" | "id"));
+            }
+
+            Ok(raw)
 
         } else {
             // Handle Response (Potential Prompt Injection)
@@ -432,5 +422,16 @@ mod tests {
         let msg = r#"{"jsonrpc": "2.0", "error": {"code": -32000, "message": "Hidden prompt <|im_start|> injection"}, "id": 1}"#;
         let res = proxy.validate_and_parse(msg).unwrap(); // validate_and_parse returns Ok(Value) on successful parsing/sanitization
         assert!(res["error"]["message"].as_str().unwrap().contains("&lt;|im_start|>"));
+    }
+
+    #[test]
+    fn test_notification_passthrough() {
+        let proxy = JsonRpcProxy::default();
+        let msg = r#"{"jsonrpc": "2.0", "method": "notify", "params": {}}"#; // No ID
+        let res = proxy.validate_and_parse(msg).unwrap();
+        // Check if "id" is present
+        if let Some(obj) = res.as_object() {
+             assert!(!obj.contains_key("id"), "Notification acquired an ID!");
+        }
     }
 }
