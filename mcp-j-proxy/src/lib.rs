@@ -151,15 +151,18 @@ impl JsonRpcProxy {
         match val {
             Value::String(s) => {
                 // Task 3.2: Regex-based sanitization
-                if self.sanitization_regex.is_match(s) {
-                    let sanitized = self.sanitization_regex.replace_all(s, |caps: &regex::Captures| {
-                        let m = &caps[0];
-                        // Replace <| with &lt;| to break tokens, obscure others
-                        m.replace("<|", "&lt;|")
-                         .replace("[", "&#91;")
-                         .replace(":", "&#58;")
-                    });
-                    *s = sanitized.into_owned();
+                // Optimization: calling replace_all directly avoids double-scanning (is_match + replace_all)
+                // when matches are found, and is efficient (single scan) when no matches are found.
+                let sanitized = self.sanitization_regex.replace_all(s, |caps: &regex::Captures| {
+                    let m = &caps[0];
+                    // Replace <| with &lt;| to break tokens, obscure others
+                    m.replace("<|", "&lt;|")
+                     .replace("[", "&#91;")
+                     .replace(":", "&#58;")
+                });
+
+                if let std::borrow::Cow::Owned(new_s) = sanitized {
+                    *s = new_s;
                     eprintln!("[PROMPT_INJECTION_ATTEMPT] Detected and neutralized LLM control tokens");
                     modified = true;
                 }
@@ -268,7 +271,8 @@ impl JsonRpcProxy {
                 // We strictly quote ALL free-text arguments for unknown tools.
                 // This ensures that even if they are passed to a shell, they are treated as literals.
                 match shlex::try_quote(s) {
-                    Ok(quoted) => *s = quoted.into_owned(),
+                    Ok(std::borrow::Cow::Owned(quoted)) => *s = quoted,
+                    Ok(std::borrow::Cow::Borrowed(_)) => {}, // Optimization: No change needed
                     Err(_) => return Err("Argument contains null byte, cannot be quoted".to_string()),
                 }
             }

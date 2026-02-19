@@ -19,3 +19,7 @@
 ## 2024-05-24 - Double Deserialization Overhead
 **Learning:** Parsing JSON into `Value`, then `from_value` into a struct, then `to_value` back to `Value` causes massive allocation overhead (deep copies) and breaks protocol correctness (e.g. notifications gaining `id: null`).
 **Action:** Validate and modify `serde_json::Value` directly in place using `get`/`get_mut` and `retain` for strictness. This yielded a ~17% speedup on mixed payloads and fixed a bug.
+
+## 2024-05-24 - String Processing Overhead in Proxy
+**Learning:** `shlex::try_quote` and `regex::Regex::replace_all` return `Cow::Borrowed` when no changes are needed. Leveraging this avoids redundant allocations and `is_match` scans.
+**Action:** Use `Cow::Borrowed` variant to skip allocations and redundant checks in hot paths involving string sanitization.
