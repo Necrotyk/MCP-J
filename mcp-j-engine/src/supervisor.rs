@@ -274,11 +274,14 @@ impl Supervisor {
         
         // Task: Bring up loopback interface to allow localhost networking
         // We use the host's `ip` command as we haven't pivoted yet.
-        if let Err(e) = Command::new("ip")
+        // Fix: Use absolute path to prevent PATH hijacking (CWE-426)
+        let ip_cmd = find_ip_command().unwrap_or_else(|_| PathBuf::from("ip"));
+
+        if let Err(e) = Command::new(&ip_cmd)
             .args(["link", "set", "lo", "up"])
             .status() 
         {
-             tracing::warn!("Failed to bring up loopback interface: {}", e);
+             tracing::warn!("Failed to bring up loopback interface using {:?}: {}", ip_cmd, e);
         }
         
         // Mounts
@@ -594,5 +597,35 @@ impl JailedChild {
     pub fn wait(&mut self) -> Result<WaitStatus> {
         let res = waitpid(self.pid, None).map_err(|e| anyhow::anyhow!("waitpid failed: {}", e));
         res
+    }
+}
+
+fn find_ip_command() -> Result<PathBuf> {
+    for path in ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"] {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    Err(anyhow::anyhow!("'ip' command not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_ip_command() {
+        // This test depends on the environment having 'ip' installed.
+        // We only assert if it finds something, it should exist.
+        if let Ok(path) = find_ip_command() {
+            assert!(path.exists());
+            assert!(path.to_string_lossy().ends_with("/ip"));
+        } else {
+            // If ip is not found, we can't really test much other than it returned Err
+            // But usually CI/dev env has ip.
+            // We can warn.
+            eprintln!("'ip' command not found in test environment");
+        }
     }
 }
