@@ -5,6 +5,7 @@ use nix::sched::{unshare, CloneFlags};
 use nix::unistd::{self, ForkResult, Pid};
 use nix::sys::wait::{waitpid, WaitStatus};
 use std::os::unix::io::{AsRawFd, RawFd, OwnedFd, AsFd};
+use std::os::unix::fs::DirBuilderExt;
 use anyhow::{Result, Context};
 use crate::landlock_ruleset::LandlockRuleset;
 use crate::seccomp_loop::SeccompLoop;
@@ -371,8 +372,17 @@ impl Supervisor {
         let pid = std::process::id(); // Use the intermediate process ID
         let upper_dir = temp_dir.join(format!("mcp_upper_{}", pid));
         let work_dir = temp_dir.join(format!("mcp_work_{}", pid));
-        if !upper_dir.exists() { std::fs::create_dir(&upper_dir).context("Failed into create upper_dir")?; }
-        if !work_dir.exists() { std::fs::create_dir(&work_dir).context("Failed to create work_dir")?; }
+
+        // Fix: Use DirBuilder to set mode 0700 and fail if exists to prevent hijacking
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&upper_dir)
+            .context("Failed to create upper_dir (possible hijacking attempt)")?;
+
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&work_dir)
+            .context("Failed to create work_dir (possible hijacking attempt)")?;
         
         let overlay_opts = format!("lowerdir={},upperdir={},workdir={}", self.project_root.display(), upper_dir.display(), work_dir.display());
         tracing::debug!("Mounting overlayfs with opts len: {}", overlay_opts.len());
