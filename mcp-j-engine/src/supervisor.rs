@@ -528,9 +528,9 @@ impl Supervisor {
         Ok(())
     }
     
-    fn install_seccomp_filter(&self, _exempt_fd: RawFd) -> Result<RawFd> {
+    fn install_seccomp_filter(&self, exempt_fd: RawFd) -> Result<RawFd> {
         // ... Same implementation as before ...
-        use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall, ScmpArch};
+        use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall, ScmpArch, ScmpArgCompare, ScmpCompareOp};
         let mut ctx = ScmpFilterContext::new(ScmpAction::Allow).context("Failed to create seccomp context")?;
         ctx.add_arch(ScmpArch::Native).context("Failed to add native arch")?;
 
@@ -541,9 +541,15 @@ impl Supervisor {
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("sendto")?).context("Failed to add sendto rule")?;
         
         // sendmsg: Exempt the socket used for Seccomp Notification Handover
-        // FIX: We ALLOW all sendmsg calls unconditionally to prevent deadlock during seccomp handover.
-        // Since default is Allow, we just don't add a Notify rule.
-        // ctx.add_rule(ScmpAction::Allow, ScmpSyscall::from_name("sendmsg")?).context("Failed to add sendmsg rule")?; 
+        // We notify on sendmsg UNLESS the FD is the exempt_fd.
+        // If fd == exempt_fd, this rule doesn't match, and we fall through to default Allow.
+        let sendmsg = ScmpSyscall::from_name("sendmsg")?;
+
+        ctx.add_rule_conditional(
+            ScmpAction::Notify,
+            sendmsg,
+            &[ScmpArgCompare::new(0, ScmpCompareOp::NotEqual, exempt_fd as u64)]
+        ).context("Failed to add sendmsg notify rule")?;
 
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("execve")?).context("Failed to add execve rule")?;
         ctx.add_rule(ScmpAction::Notify, ScmpSyscall::from_name("execveat")?).context("Failed to add execveat rule")?;
