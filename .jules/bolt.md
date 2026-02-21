@@ -31,3 +31,7 @@
 ## 2024-05-25 - Regex Sanitization Allocation
 **Learning:** Chained `str::replace` calls inside a `regex::replace_all` closure allocate intermediate `String`s for each replacement step. Using a single-pass character iterator with a pre-allocated buffer avoids these redundant allocations, improving performance by ~13% in heavy sanitization scenarios.
 **Action:** Use single-pass string building instead of chained replacements for multi-step string sanitization.
+
+## 2025-02-12 - Seccomp Loop Allocation Hoisting
+**Learning:** Reusing a single `Vec<u8>` buffer for reading paths in the seccomp loop eliminates heap allocations for every file access syscall (`open`, `execve`), significantly reducing allocator pressure in high-throughput scenarios.
+**Action:** Always look for temporary buffers allocated in hot loops (like syscall handlers) and hoist them to the outer loop scope.
