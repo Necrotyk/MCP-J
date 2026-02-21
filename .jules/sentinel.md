@@ -12,3 +12,8 @@
 **Vulnerability:** `sendmsg` was unconditionally allowed to prevent a deadlock during seccomp notification handover, creating a network security bypass. Attempts to fix this with mixed `Allow` (conditional) and `Notify` (unconditional) rules failed because `Notify` has higher priority than `Allow` in BPF/libseccomp.
 **Learning:** In seccomp filters, if multiple rules match a syscall, the action with the highest priority wins. `Notify` > `Allow`. Mixing conditional `Allow` with general `Notify` results in `Notify` always winning, re-introducing the deadlock.
 **Prevention:** Use a single conditional rule with the higher priority action (e.g., `Notify` if `fd != exempt_fd`) rather than multiple conflicting rules.
+
+## 2024-05-27 - Execveat TOCTOU and Allowlist Bypass
+**Vulnerability:** The `execveat` syscall handler allowed execution of any binary residing within a `readonly_mounts` path (e.g., `/bin`, `/usr/bin`). This bypassed the strict `execve` whitelist policy intended to block shells and unauthorized binaries.
+**Learning:** Validating execution based solely on file location (e.g., "is in a read-only system mount") is insufficient security. It conflates "safe to read/map" with "safe to execute". An attacker can leverage `execveat` with a file descriptor to a standard shell (`/bin/sh`) located in a trusted mount to gain arbitrary code execution.
+**Prevention:** Execution control logic must consistently enforce the same strict allowlist policy across all execution-related syscalls (`execve`, `execveat`). Do not assume that files in trusted/read-only locations are safe to execute unless explicitly whitelisted.

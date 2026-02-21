@@ -357,15 +357,32 @@ impl SeccompLoop {
             Err(_) => return Ok(self.resp_error(req, libc::EACCES)),
         };
         
-        // Verify path against manifest
-        let is_allowed = self.manifest.readonly_mounts.iter().any(|prefix| {
-            link_path.starts_with(prefix)
-        }) || link_path == self.allowed_command;
+        // Verify path against manifest (Strict Allowlist Only)
+        // Task: Fix vulnerability where any readonly mount path was allowed.
+        // Now aligning with handle_execve logic: Exact match on allowed_command OR allowed_runtimes.
+
+        // 1. Explicit Deny List (Shells)
+        let binding = link_path.file_name().unwrap_or_default().to_string_lossy();
+        let name = binding.as_ref();
+        match name {
+            "sh" | "bash" | "dash" | "zsh" | "csh" | "ksh" | "powershell" | "pwsh" | "cmd.exe" => {
+                tracing::warn!(pid = tracee_pid, binary = ?name, "Blocked shell execution attempt via execveat");
+                return Ok(self.resp_error(req, libc::EACCES));
+            },
+            _ => {}
+        }
+
+        // 2. Exact Match Allow List
+        let mut is_allowed = link_path == self.allowed_command;
+        if !is_allowed {
+            is_allowed = self.manifest.allowed_runtimes.iter().any(|p| link_path == std::path::Path::new(p));
+        }
 
         if is_allowed {
              tracing::debug!(pid = tracee_pid, path = ?link_path, "Authorizing execveat(FD)");
              Ok(self.resp_continue(req))
         } else {
+             tracing::warn!(pid = tracee_pid, path = ?link_path, "Blocked execveat() - Not in ExactMatch AllowList");
              Ok(self.resp_error(req, libc::EACCES))
         }
     }
