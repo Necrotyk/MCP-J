@@ -57,9 +57,6 @@ impl JsonRpcProxy {
                 }
         };
 
-        // Extract ID for error reporting
-        let id = raw.get("id").cloned().unwrap_or(Value::Null);
-
         // Check if it's a Request (has method) or Response (has result/error)
         let is_request = raw.get("method").is_some();
 
@@ -73,6 +70,9 @@ impl JsonRpcProxy {
                 }
             }
 
+            // Helper to get ID for error reporting (lazy extraction)
+            let get_id = |raw: &Value| raw.get("id").unwrap_or(&Value::Null).clone();
+
             // 2. Protocol Enforcement (Manual Validation)
             // Ensure jsonrpc is "2.0"
             match raw.get("jsonrpc") {
@@ -80,33 +80,43 @@ impl JsonRpcProxy {
                 _ => return Err(serde_json::json!({
                     "jsonrpc": "2.0",
                     "error": { "code": -32600, "message": "Invalid JSON-RPC version" },
-                    "id": id
+                    "id": get_id(&raw)
                 }))
             }
 
+            enum MethodAction {
+                ToolsCall,
+                Restricted,
+                Other,
+            }
+
             // Ensure method is a string and valid
-            let method_str = match raw.get("method") {
-                Some(Value::String(s)) => s.clone(),
+            let method_action = match raw.get("method") {
+                Some(Value::String(s)) => match s.as_str() {
+                    "tools/call" => MethodAction::ToolsCall,
+                    "mcp-remote/authorize" | "mcp-remote/token" => MethodAction::Restricted,
+                    _ => MethodAction::Other,
+                },
                 _ => return Err(serde_json::json!({
                     "jsonrpc": "2.0",
                     "error": { "code": -32600, "message": "Invalid Request: method must be a string" },
-                    "id": id
+                    "id": get_id(&raw)
                 }))
             };
 
             // 3. Method Validation & Logic
-            let validation_result = match method_str.as_str() {
-                "tools/call" => {
+            let validation_result = match method_action {
+                MethodAction::ToolsCall => {
                     if let Some(params) = raw.get_mut("params") {
                         self.validate_tool_call(params)
                     } else {
                          Ok(())
                     }
                 }
-                "mcp-remote/authorize" | "mcp-remote/token" => {
+                MethodAction::Restricted => {
                      Err("Blocked restricted method: mcp-remote/*".to_string())
                 }
-                _ => Ok(())
+                MethodAction::Other => Ok(())
             };
 
             if let Err(msg) = validation_result {
@@ -117,7 +127,7 @@ impl JsonRpcProxy {
                             "code": code,
                             "message": format!("MCP-J SECCOMP: {}", msg)
                         },
-                        "id": id
+                        "id": get_id(&raw)
                     });
                     return Err(err);
             }
