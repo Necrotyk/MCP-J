@@ -155,12 +155,26 @@ impl JsonRpcProxy {
                 // when matches are found, and is efficient (single scan) when no matches are found.
                 let sanitized = self.sanitization_regex.replace_all(s, |caps: &regex::Captures| {
                     let m = &caps[0];
-                    let mut out = m.to_string();
-                    // Optimization: Avoid chained allocations for each replacement.
-                    // This reduces allocations from 3 to 1 (or 2 if match found).
-                    if out.contains("<|") { out = out.replace("<|", "&lt;|"); }
-                    if out.contains("[") { out = out.replace("[", "&#91;"); }
-                    if out.contains(":") { out = out.replace(":", "&#58;"); }
+                    // Optimization: Avoid multiple String allocations by building the result in a single pass.
+                    // Previous implementation used m.to_string() then up to 3 .replace() calls, causing up to 4 allocations.
+                    let mut out = String::with_capacity(m.len() + 8);
+
+                    let mut chars = m.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '<' => {
+                                // Check for literal <| which we want to sanitize to &lt;|
+                                if let Some(&'|') = chars.peek() {
+                                    out.push_str("&lt;");
+                                } else {
+                                    out.push('<');
+                                }
+                            }
+                            '[' => out.push_str("&#91;"),
+                            ':' => out.push_str("&#58;"),
+                            _ => out.push(c),
+                        }
+                    }
                     out
                 });
 
