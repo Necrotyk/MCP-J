@@ -72,23 +72,22 @@ impl SeccompLoop {
 
     
     // Helper to read memory from the tracee
-    fn read_tracee_memory(&self, pid: pid_t, addr: u64, len: usize) -> Result<Vec<u8>> {
-        
-        let mut buf = vec![0u8; len];
-        let mut local_iov = [IoSliceMut::new(&mut buf)];
+    fn read_tracee_memory(&self, pid: pid_t, addr: u64, buf: &mut [u8]) -> Result<()> {
+        let len = buf.len();
+        let mut local_iov = [IoSliceMut::new(buf)];
         let remote_iov = [RemoteIoVec { base: addr as usize, len }];
         
         let n = process_vm_readv(nix::unistd::Pid::from_raw(pid), &mut local_iov, &remote_iov)?;
         if n != len {
             // Partial read?
-            anyhow::bail!("Partial read from tracee memory: requested {}, read {}", len, n);
+            anyhow::bail!("Partial read from tracee memory: requested {}, read {}", buf.len(), n);
         }
-        Ok(buf)
+        Ok(())
     }
 
     // Helper to read path bytes from tracee memory (page aligned)
     fn read_path_tracee(&self, pid: pid_t, addr: u64) -> Result<Vec<u8>> {
-        let mut path_buf = Vec::new();
+        let mut path_buf = Vec::with_capacity(4096);
         let max_len = 4096;
         let page_size = 4096;
         let mut current_addr = addr as usize;
@@ -107,8 +106,11 @@ impl SeccompLoop {
                 break;
             }
             
-            let mut buf = vec![0u8; chunk_size];
-            let mut local_iov = [IoSliceMut::new(&mut buf)];
+            // Optimization: Read directly into path_buf to avoid intermediate allocation/copy
+            let current_len = path_buf.len();
+            path_buf.resize(current_len + chunk_size, 0);
+
+            let mut local_iov = [IoSliceMut::new(&mut path_buf[current_len..])];
             let remote_iov = [RemoteIoVec { base: current_addr, len: chunk_size }];
             
             let n = match process_vm_readv(nix::unistd::Pid::from_raw(pid), &mut local_iov, &remote_iov) {
@@ -123,12 +125,12 @@ impl SeccompLoop {
                 return Err(anyhow::anyhow!("Unexpected 0-byte read (EOF)"));
             }
             
-            let read_slice = &buf[..n];
-            if let Some(pos) = read_slice.iter().position(|&b| b == 0) {
-                path_buf.extend_from_slice(&read_slice[..pos]);
+            // Check for null terminator in the newly read chunk
+            if let Some(pos) = path_buf[current_len..current_len+n].iter().position(|&b| b == 0) {
+                path_buf.truncate(current_len + pos);
                 break;
             } else {
-                path_buf.extend_from_slice(read_slice);
+                path_buf.truncate(current_len + n);
                 current_addr += n;
             }
         }
@@ -406,12 +408,8 @@ impl SeccompLoop {
         // size_t msg_controllen; (40)
         // int msg_flags; (48)
         
-        let header_bytes = match self.read_tracee_memory(tracee_pid, msg_ptr, 16) { // Read first 16 bytes for name and namelen
-             Ok(b) => b,
-             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
-        };
-        
-        if header_bytes.len() < 16 {
+        let mut header_bytes = [0u8; 16];
+        if let Err(_) = self.read_tracee_memory(tracee_pid, msg_ptr, &mut header_bytes) {
              return Ok(self.resp_error(req, libc::EFAULT));
         }
         
@@ -437,15 +435,13 @@ impl SeccompLoop {
              return Ok(self.resp_error(req, libc::EINVAL));
         }
 
-        let buf = match self.read_tracee_memory(pid, addr_ptr, addr_len) {
-            Ok(b) => b,
-            Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
-        };
-
-        if buf.len() < 2 {
-             return Ok(self.resp_error(req, libc::EINVAL));
+        let mut buf = [0u8; 128];
+        // Ensure we don't panic on slice access, although checked above.
+        let safe_len = std::cmp::min(addr_len, buf.len());
+        if let Err(_) = self.read_tracee_memory(pid, addr_ptr, &mut buf[..safe_len]) {
+            return Ok(self.resp_error(req, libc::EFAULT));
         }
-        
+
         let sa_family = u16::from_ne_bytes([buf[0], buf[1]]);
         
         match sa_family as i32 {
