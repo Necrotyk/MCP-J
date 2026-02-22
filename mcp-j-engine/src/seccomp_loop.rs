@@ -108,7 +108,14 @@ impl SeccompLoop {
             
             // Optimization: Read directly into buf to avoid intermediate allocation/copy
             let current_len = buf.len();
-            buf.resize(current_len + chunk_size, 0);
+
+            // SAFETY: We use set_len to expose uninitialized memory to avoid the cost of memset (buf.resize).
+            // This is safe because:
+            // 1. process_vm_readv writes directly to this memory (via IoSliceMut).
+            // 2. We truncate the buffer immediately after the read if the read is partial or fails,
+            //    ensuring no uninitialized memory is exposed to safe code.
+            buf.reserve(chunk_size);
+            unsafe { buf.set_len(current_len + chunk_size); }
 
             let mut local_iov = [IoSliceMut::new(&mut buf[current_len..])];
             let remote_iov = [RemoteIoVec { base: current_addr, len: chunk_size }];
