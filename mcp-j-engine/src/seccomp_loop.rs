@@ -86,31 +86,31 @@ impl SeccompLoop {
     }
 
     // Helper to read path bytes from tracee memory (page aligned)
-    fn read_path_tracee(&self, pid: pid_t, addr: u64) -> Result<Vec<u8>> {
-        let mut path_buf = Vec::with_capacity(4096);
+    fn read_path_tracee(&self, pid: pid_t, addr: u64, buf: &mut Vec<u8>) -> Result<()> {
+        buf.clear();
         let max_len = 4096;
         let page_size = 4096;
         let mut current_addr = addr as usize;
         
         // Task 2.3: Robust memory reading loop
         loop {
-            if path_buf.len() >= max_len {
+            if buf.len() >= max_len {
                 return Err(anyhow::anyhow!("Path too long"));
             }
             
             // Calculate distance to next page boundary
             let bytes_to_boundary = page_size - (current_addr % page_size);
-            let chunk_size = std::cmp::min(bytes_to_boundary, max_len - path_buf.len());
+            let chunk_size = std::cmp::min(bytes_to_boundary, max_len - buf.len());
             
             if chunk_size == 0 {
                 break;
             }
             
-            // Optimization: Read directly into path_buf to avoid intermediate allocation/copy
-            let current_len = path_buf.len();
-            path_buf.resize(current_len + chunk_size, 0);
+            // Optimization: Read directly into buf to avoid intermediate allocation/copy
+            let current_len = buf.len();
+            buf.resize(current_len + chunk_size, 0);
 
-            let mut local_iov = [IoSliceMut::new(&mut path_buf[current_len..])];
+            let mut local_iov = [IoSliceMut::new(&mut buf[current_len..])];
             let remote_iov = [RemoteIoVec { base: current_addr, len: chunk_size }];
             
             let n = match process_vm_readv(nix::unistd::Pid::from_raw(pid), &mut local_iov, &remote_iov) {
@@ -126,21 +126,24 @@ impl SeccompLoop {
             }
             
             // Check for null terminator in the newly read chunk
-            if let Some(pos) = path_buf[current_len..current_len+n].iter().position(|&b| b == 0) {
-                path_buf.truncate(current_len + pos);
+            if let Some(pos) = buf[current_len..current_len+n].iter().position(|&b| b == 0) {
+                buf.truncate(current_len + pos);
                 break;
             } else {
-                path_buf.truncate(current_len + n);
+                buf.truncate(current_len + n);
                 current_addr += n;
             }
         }
         
-        Ok(path_buf)
+        Ok(())
     }
 
     pub fn run(&self) -> Result<()> {
         println!("Seccomp loop running on FD: {}", self.notify_fd);
         
+        // Bolt Optimization: Reuse buffer for path reading to avoid frequent allocations
+        let mut path_buffer = Vec::with_capacity(4096);
+
         loop {
             // Receive notification
             // We must zero initialize the struct as per C conventions generally, 
@@ -161,7 +164,7 @@ impl SeccompLoop {
             }
 
             // Process
-            let resp = self.handle_request(&req)?;
+            let resp = self.handle_request(&req, &mut path_buffer)?;
 
             // Send response
             let ret = unsafe { libc::ioctl(self.notify_fd, SECCOMP_IOCTL_NOTIF_SEND as _, &resp) };
@@ -176,7 +179,7 @@ impl SeccompLoop {
         }
     }
 
-    fn handle_request(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+    fn handle_request(&self, req: &seccomp_notif, path_buffer: &mut Vec<u8>) -> Result<seccomp_notif_resp> {
         let syscall = req.data.nr as i64;
         
         // Match syscalls
@@ -185,16 +188,16 @@ impl SeccompLoop {
         
         match syscall {
             libc::SYS_connect => self.handle_connect(req),
-            libc::SYS_execve => self.handle_execve(req),
-            libc::SYS_execveat => self.handle_execveat(req),
+            libc::SYS_execve => self.handle_execve(req, path_buffer),
+            libc::SYS_execveat => self.handle_execveat(req, path_buffer),
             libc::SYS_bind => self.handle_bind(req),
             libc::SYS_sendto => self.handle_sendto(req),
             libc::SYS_sendmsg => self.handle_sendmsg(req),
-            libc::SYS_openat => self.handle_openat(req),
+            libc::SYS_openat => self.handle_openat(req, path_buffer),
             libc::SYS_open => {
                 // Legacy open: int open(const char *pathname, int flags, mode_t mode);
                 // Mapped to handle_openat(AT_FDCWD, path, flags, mode)
-                self.handle_open_legacy(req)
+                self.handle_open_legacy(req, path_buffer)
             }
             _ => {
                // Allow others by default for now (e.g. read, write)
@@ -237,7 +240,7 @@ impl SeccompLoop {
         self.validate_address(tracee_pid as i32, addr_ptr, addr_len, req)
     }
 
-    fn handle_execve(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+    fn handle_execve(&self, req: &seccomp_notif, path_buffer: &mut Vec<u8>) -> Result<seccomp_notif_resp> {
         // Task 1: Eliminate execve TOCTOU
         // Strategy: Block unauthorized execve(), but ALLOW the initial agent launch.
         
@@ -249,17 +252,15 @@ impl SeccompLoop {
         let filename_ptr = req.data.args[0];
         let tracee_pid = req.pid as pid_t;
         
-        let path_bytes = match self.read_path_tracee(tracee_pid, filename_ptr) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!("Failed to read execve path from tracee: {}", e);
-                return Ok(self.resp_error(req, libc::EACCES));
-            }
-        };
+        if let Err(e) = self.read_path_tracee(tracee_pid, filename_ptr, path_buffer) {
+             tracing::warn!("Failed to read execve path from tracee: {}", e);
+             return Ok(self.resp_error(req, libc::EACCES));
+        }
+        let path_bytes = &path_buffer[..];
         
         // Use OsStr for path comparison to avoid UTF-8 issues if possible, 
         // but verify against string allowlists.
-        let path_str = String::from_utf8_lossy(&path_bytes);
+        let path_str = String::from_utf8_lossy(path_bytes);
         let path = std::path::Path::new(path_str.as_ref());
         
         // 1. Explicit Deny List (Shells)
@@ -310,7 +311,7 @@ impl SeccompLoop {
         }
     }
 
-    fn handle_execveat(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+    fn handle_execveat(&self, req: &seccomp_notif, path_buffer: &mut Vec<u8>) -> Result<seccomp_notif_resp> {
         // execveat(dirfd, pathname, argv, envp, flags)
         let dirfd = req.data.args[0] as i32;
         let _ptr = req.data.args[1]; 
@@ -325,13 +326,15 @@ impl SeccompLoop {
 
         // Verify path is actually empty (Linux kernel should enforce this with AT_EMPTY_PATH, but we double check)
         if req.data.args[1] != 0 {
-             let path_bytes = self.read_path_tracee(tracee_pid, req.data.args[1]).unwrap_or_default();
-             // Check if it contains anything other than null.
-             // read_path_tracee stops at null or max length.
-             if !path_bytes.is_empty() && path_bytes != b"\0" {
-                 // If using AT_EMPTY_PATH, path should be ""
-                 tracing::warn!(pid = tracee_pid, "Blocked execveat() with non-empty path bypass");
-                 return Ok(self.resp_error(req, libc::EACCES));
+             if let Ok(()) = self.read_path_tracee(tracee_pid, req.data.args[1], path_buffer) {
+                 let path_bytes = &path_buffer[..];
+                 // Check if it contains anything other than null.
+                 // read_path_tracee stops at null or max length.
+                 if !path_bytes.is_empty() && path_bytes != b"\0" {
+                     // If using AT_EMPTY_PATH, path should be ""
+                     tracing::warn!(pid = tracee_pid, "Blocked execveat() with non-empty path bypass");
+                     return Ok(self.resp_error(req, libc::EACCES));
+                 }
              }
         }
         
@@ -513,19 +516,19 @@ impl SeccompLoop {
         }
     }
 
-    fn handle_openat(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+    fn handle_openat(&self, req: &seccomp_notif, path_buffer: &mut Vec<u8>) -> Result<seccomp_notif_resp> {
         let dirfd = req.data.args[0] as i32;
         let path_ptr = req.data.args[1];
         let tracee_pid = req.pid as pid_t;
         
         // 1. Read path bytes
-        let path_bytes = match self.read_path_tracee(tracee_pid, path_ptr) {
-             Ok(p) => p,
-             Err(_) => return Ok(self.resp_error(req, libc::EFAULT)),
-        };
+        if let Err(_) = self.read_path_tracee(tracee_pid, path_ptr, path_buffer) {
+             return Ok(self.resp_error(req, libc::EFAULT));
+        }
+        let path_bytes = &path_buffer[..];
 
         // Shared Security Claims (Traversal + System Mount Protection)
-        if let Err(resp) = self.validate_path_security(tracee_pid, &path_bytes, req.data.args[2] as i32, req.id) {
+        if let Err(resp) = self.validate_path_security(tracee_pid, path_bytes, req.data.args[2] as i32, req.id) {
              return Ok(resp);
         }
 
@@ -575,10 +578,10 @@ impl SeccompLoop {
         // 3. Perform safe open
         let flags = req.data.args[2]; // openat(dirfd, path, flags, mode)
         let mode = req.data.args[3];
-        let file = match crate::fs_utils::safe_open_beneath(&root_handle, &path_bytes, flags, mode) {
+        let file = match crate::fs_utils::safe_open_beneath(&root_handle, path_bytes, flags, mode) {
             Ok(f) => f,
             Err(e) => {
-                let path_lossy = String::from_utf8_lossy(&path_bytes);
+                let path_lossy = String::from_utf8_lossy(path_bytes);
                 tracing::warn!(pid = tracee_pid, path = %path_lossy, error = %e, "Blocked openat access");
                 return Ok(self.resp_error(req, libc::EACCES));
             }
@@ -616,22 +619,20 @@ impl SeccompLoop {
     }
 
     // Handling legacy open syscall: open(path, flags, mode)
-    fn handle_open_legacy(&self, req: &seccomp_notif) -> Result<seccomp_notif_resp> {
+    fn handle_open_legacy(&self, req: &seccomp_notif, path_buffer: &mut Vec<u8>) -> Result<seccomp_notif_resp> {
          let ptr = req.data.args[0];
          let flags = req.data.args[1];
          let mode = req.data.args[2];
          
          let tracee_pid = req.pid as pid_t;
-         let path_bytes = match self.read_path_tracee(tracee_pid, ptr) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(pid = tracee_pid, error = %e, "Failed to read open path");
-                return Ok(self.resp_error(req, libc::EFAULT));
-            }
-         };
+         if let Err(e) = self.read_path_tracee(tracee_pid, ptr, path_buffer) {
+             tracing::error!(pid = tracee_pid, error = %e, "Failed to read open path");
+             return Ok(self.resp_error(req, libc::EFAULT));
+         }
+         let path_bytes = &path_buffer[..];
          
         // Shared Security Claims (Traversal + System Mount Protection)
-        if let Err(resp) = self.validate_path_security(tracee_pid, &path_bytes, flags as i32, req.id) {
+        if let Err(resp) = self.validate_path_security(tracee_pid, path_bytes, flags as i32, req.id) {
              return Ok(resp);
         }
 
@@ -667,7 +668,7 @@ impl SeccompLoop {
                }
           }
          
-         match crate::fs_utils::safe_open_beneath(&root_handle, &path_bytes, flags, mode) {
+         match crate::fs_utils::safe_open_beneath(&root_handle, path_bytes, flags, mode) {
             Ok(file) => {
                 let injected = self.inject_fd(req, file.as_raw_fd())?;
                 Ok(seccomp_notif_resp {
@@ -678,7 +679,7 @@ impl SeccompLoop {
                 })
             }
             Err(e) => {
-                let path_lossy = String::from_utf8_lossy(&path_bytes);
+                let path_lossy = String::from_utf8_lossy(path_bytes);
                 tracing::warn!(pid = tracee_pid, path = %path_lossy, error = %e, "Blocked open(legacy) access");
                 Ok(self.resp_error(req, libc::EACCES))
             }
