@@ -35,3 +35,7 @@
 ## 2025-02-12 - Seccomp Loop Allocation Hoisting
 **Learning:** Reusing a single `Vec<u8>` buffer for reading paths in the seccomp loop eliminates heap allocations for every file access syscall (`open`, `execve`), significantly reducing allocator pressure in high-throughput scenarios.
 **Action:** Always look for temporary buffers allocated in hot loops (like syscall handlers) and hoist them to the outer loop scope.
+
+## 2025-05-24 - Seccomp Loop Zero-Initialization Avoidance
+**Learning:** `Vec::resize(len, 0)` in `mcp-j-engine`'s seccomp loop performs a redundant `memset` on the path buffer for every syscall, even when reused. Replacing it with `reserve` + `unsafe { set_len }` eliminates this overhead.
+**Action:** Use `reserve` + `unsafe { set_len }` when reading into a buffer via FFI (like `process_vm_readv`) where the memory is immediately overwritten.
